@@ -105,9 +105,13 @@ def init_db() -> None:
                 side TEXT NOT NULL,
                 price REAL,
                 bot_usdc_size REAL,
+                bot_units REAL,
+                title TEXT,
                 order_id TEXT,
+                realized_pnl REAL,
                 status TEXT NOT NULL DEFAULT 'submitted',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                closed_at TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_copied_trades_source_wallet
@@ -116,6 +120,19 @@ def init_db() -> None:
                 ON copied_trades (asset);
             """
         )
+        _ensure_column(conn, "copied_trades", "bot_units", "REAL")
+        _ensure_column(conn, "copied_trades", "title", "TEXT")
+        _ensure_column(conn, "copied_trades", "realized_pnl", "REAL")
+        _ensure_column(conn, "copied_trades", "closed_at", "TEXT")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def activity_key(activity: dict) -> str:
@@ -216,6 +233,83 @@ def update_copied_trade(transaction_hash: str, update: dict) -> None:
         )
 
 
+def estimate_close_pnl(source_wallet: str, asset: str, sell_units: float, sell_price: float) -> dict:
+    """
+    Estimate close P&L from copied BUY rows in FIFO-ish aggregate form.
+    This does not mutate open lots; it is a notification/reporting estimate.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(bot_units), 0) AS buy_units,
+                COALESCE(SUM(bot_usdc_size), 0) AS buy_cost
+            FROM copied_trades
+            WHERE source_wallet = ?
+              AND asset = ?
+              AND side = 'BUY'
+              AND status IN ('claimed', 'submitted', 'filled')
+            """,
+            (source_wallet.lower(), asset),
+        ).fetchone()
+
+    buy_units = float(row["buy_units"] or 0)
+    buy_cost = float(row["buy_cost"] or 0)
+    sell_units = max(float(sell_units or 0), 0)
+    sell_price = float(sell_price or 0)
+    sell_value = sell_units * sell_price
+    avg_entry_price = buy_cost / buy_units if buy_units > 0 else 0
+    cost_basis = min(sell_units, buy_units) * avg_entry_price if avg_entry_price > 0 else 0
+    pnl = sell_value - cost_basis if cost_basis > 0 else 0
+
+    return {
+        "pnl": pnl,
+        "sell_value": sell_value,
+        "cost_basis": cost_basis,
+        "avg_entry_price": avg_entry_price,
+        "matched_units": min(sell_units, buy_units),
+        "has_basis": cost_basis > 0,
+    }
+
+
+def estimate_settlement_pnl(source_wallet: str, asset: str, settlement_price: float = 0) -> dict:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(bot_units), 0) AS buy_units,
+                COALESCE(SUM(bot_usdc_size), 0) AS buy_cost
+            FROM copied_trades
+            WHERE source_wallet = ?
+              AND asset = ?
+              AND side = 'BUY'
+              AND status IN ('claimed', 'submitted', 'filled')
+            """,
+            (source_wallet.lower(), asset),
+        ).fetchone()
+
+    buy_units = float(row["buy_units"] or 0)
+    buy_cost = float(row["buy_cost"] or 0)
+    sell_value = buy_units * float(settlement_price or 0)
+    pnl = sell_value - buy_cost if buy_cost > 0 else 0
+    return {
+        "pnl": pnl,
+        "sell_value": sell_value,
+        "cost_basis": buy_cost,
+        "avg_entry_price": buy_cost / buy_units if buy_units > 0 else 0,
+        "matched_units": buy_units,
+        "has_basis": buy_cost > 0,
+    }
+
+
+def total_realized_pnl() -> float:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM copied_trades"
+        ).fetchone()
+    return float(row["pnl"] or 0)
+
+
 def sum_trader_exposure(source_wallet: str) -> float:
     with connect() as conn:
         row = conn.execute(
@@ -223,6 +317,7 @@ def sum_trader_exposure(source_wallet: str) -> float:
             SELECT COALESCE(SUM(bot_usdc_size), 0) AS exposure
             FROM copied_trades
             WHERE source_wallet = ?
+              AND side = 'BUY'
               AND status IN ('claimed', 'submitted', 'filled')
             """,
             (source_wallet.lower(),),

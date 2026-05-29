@@ -6,9 +6,17 @@ BEFORE the order hits Polymarket. A duplicate key means the event is a replay
 and must not place a second order.
 """
 from typing import Optional
+from datetime import datetime, timezone
 
 from config import get_config
-from db import insert_copied_trade, sum_trader_exposure, update_copied_trade
+from db import (
+    estimate_close_pnl,
+    estimate_settlement_pnl,
+    insert_copied_trade,
+    sum_trader_exposure,
+    total_realized_pnl,
+    update_copied_trade,
+)
 from logger import logger
 
 
@@ -23,6 +31,8 @@ def claim_trade(
     price: float,
     bot_usdc_size: float,
     condition_id: Optional[str] = None,
+    bot_units: Optional[float] = None,
+    title: Optional[str] = None,
 ) -> bool:
     """
     Atomically claim a source-trade for copying. Returns True if this process
@@ -40,6 +50,8 @@ def claim_trade(
         "side": side,
         "price": price,
         "bot_usdc_size": bot_usdc_size,
+        "bot_units": bot_units,
+        "title": title,
         "status": "claimed",
     }
     try:
@@ -52,11 +64,19 @@ def claim_trade(
         return False
 
 
-def mark_trade(transaction_hash: str, status: str, order_id: Optional[str] = None) -> None:
+def mark_trade(
+    transaction_hash: str,
+    status: str,
+    order_id: Optional[str] = None,
+    realized_pnl: Optional[float] = None,
+) -> None:
     """Update the ledger row after the order attempt."""
     update = {"status": status}
     if order_id:
         update["order_id"] = order_id
+    if realized_pnl is not None:
+        update["realized_pnl"] = realized_pnl
+        update["closed_at"] = datetime.now(timezone.utc).isoformat()
     try:
         update_copied_trade(transaction_hash, update)
     except Exception as e:
@@ -72,4 +92,42 @@ def trader_exposure(source_wallet: str) -> float:
         return sum_trader_exposure(source_wallet)
     except Exception as e:
         logger.warning(f"trader_exposure lookup failed for {source_wallet[:10]}...: {e}")
+        return 0.0
+
+
+def close_pnl_estimate(source_wallet: str, asset: str, sell_units: float, sell_price: float) -> dict:
+    try:
+        return estimate_close_pnl(source_wallet, asset, sell_units, sell_price)
+    except Exception as e:
+        logger.warning(f"close_pnl_estimate failed for {asset}: {e}")
+        return {
+            "pnl": 0.0,
+            "sell_value": sell_units * sell_price,
+            "cost_basis": 0.0,
+            "avg_entry_price": 0.0,
+            "matched_units": 0.0,
+            "has_basis": False,
+        }
+
+
+def settlement_pnl_estimate(source_wallet: str, asset: str, settlement_price: float = 0) -> dict:
+    try:
+        return estimate_settlement_pnl(source_wallet, asset, settlement_price)
+    except Exception as e:
+        logger.warning(f"settlement_pnl_estimate failed for {asset}: {e}")
+        return {
+            "pnl": 0.0,
+            "sell_value": 0.0,
+            "cost_basis": 0.0,
+            "avg_entry_price": 0.0,
+            "matched_units": 0.0,
+            "has_basis": False,
+        }
+
+
+def realized_pnl_total() -> float:
+    try:
+        return total_realized_pnl()
+    except Exception as e:
+        logger.warning(f"realized_pnl_total lookup failed: {e}")
         return 0.0

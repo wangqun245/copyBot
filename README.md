@@ -132,6 +132,11 @@ TRADER_WALLET=trader-wallet-address-to-copy
 
 # Optional: Sizing Configuration
 STAKE_WHALE_PCT=0.001
+
+# Optional: Telegram notifications
+TELEGRAM_BOT_TOKEN=your-telegram-bot-token
+TELEGRAM_CHAT_ID=your-telegram-chat-id
+TELEGRAM_TITLE_SUFFIX=_LOCAL
 ```
 
 **Getting Your Credentials:**
@@ -170,6 +175,8 @@ TRADER_WALLET=         # Trader wallet address to copy
 TRADER_WALLET=         # Trader wallet address to copy (can be changed anytime)
 BANKROLL=500          # Your trading capital (default: 1000)
 STAKE_WHALE_PCT=0.001 # Copy 0.1% of trader's size (default: 0.005)
+TELEGRAM_BOT_TOKEN=   # Enables copy-trade and result alerts when set with TELEGRAM_CHAT_ID
+TELEGRAM_CHAT_ID=     # Telegram chat to receive bot alerts
 ```
 
 ### Position Sizing Examples
@@ -262,7 +269,7 @@ Contributions to this **polymarket-copy-trading-bot** are welcome!
 
 - [ ] Web dashboard for monitoring
 - [ ] Advanced risk management features
-- [ ] Telegram/Discord notifications
+- [x] Telegram notifications
 
 ## 📄 License
 
