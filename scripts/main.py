@@ -1,6 +1,7 @@
 import asyncio
 import time
 import traceback
+from datetime import datetime, timezone
 from typing import Optional
 
 from make_orders import make_order
@@ -24,6 +25,7 @@ from copied_trades import (
     trader_exposure,
 )
 from config import get_config
+from db import count_historic_activities, count_positions
 from logger import logger
 from notifier import copy_result_alert, copy_trade_alert
 
@@ -35,6 +37,9 @@ except ImportError:
 
 
 config = get_config()
+STARTUP_EPOCH_SECONDS = int(time.time())
+MARKET_STATUS_CACHE_SECONDS = 30
+_market_status_cache = {}
 
 
 def is_target_trader(wallet: str) -> bool:
@@ -57,6 +62,107 @@ def _order_success(resp: Optional[dict]) -> bool:
 
 def _order_id(resp: Optional[dict]) -> Optional[str]:
     return resp.get("orderID") if resp else None
+
+
+def _parse_timestamp(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _is_fresh_startup_buy(record: dict) -> bool:
+    timestamp = _parse_timestamp(record.get("timestamp"))
+    if timestamp is None:
+        logger.warning(f"Skipping BUY without timestamp: {record.get('transaction_hash')}")
+        return False
+
+    now = time.time()
+    if timestamp < STARTUP_EPOCH_SECONDS:
+        logger.info(
+            f"Skipping pre-startup BUY {record.get('transaction_hash')} "
+            f"from {datetime.fromtimestamp(timestamp, timezone.utc).isoformat()}"
+        )
+        return False
+
+    age = now - timestamp
+    if age > config.COPY_BUY_MAX_AGE_SECONDS:
+        logger.info(
+            f"Skipping stale BUY {record.get('transaction_hash')} "
+            f"age={age:.1f}s max={config.COPY_BUY_MAX_AGE_SECONDS}s"
+        )
+        return False
+    return True
+
+
+def _market_is_open(record: dict) -> bool:
+    slug = record.get("slug")
+    if not slug:
+        logger.warning(f"Skipping trade without market slug: {record.get('transaction_hash')}")
+        return False
+
+    now = time.time()
+    cached = _market_status_cache.get(slug)
+    if cached and now - cached["checked_at"] < MARKET_STATUS_CACHE_SECONDS:
+        return cached["is_open"]
+
+    try:
+        from http_client import get_json
+
+        markets = get_json("https://gamma-api.polymarket.com/markets", params={"slug": slug}, timeout=5)
+        market = markets[0] if markets else None
+        is_open = bool(market) and _market_payload_is_open(market)
+    except Exception as e:
+        logger.warning(f"Market status lookup failed for {slug}: {e}; skipping copy")
+        is_open = False
+
+    _market_status_cache[slug] = {"checked_at": now, "is_open": is_open}
+    if not is_open:
+        logger.info(f"Skipping closed/inactive market: {slug}")
+    return is_open
+
+
+def _market_payload_is_open(market: dict) -> bool:
+    if not market.get("active", False):
+        return False
+    if market.get("closed") or market.get("archived"):
+        return False
+    if market.get("acceptingOrders") is False or market.get("enableOrderBook") is False:
+        return False
+
+    end_date = _parse_datetime(market.get("endDate") or market.get("endDateIso"))
+    if end_date:
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+        if end_date <= datetime.now(timezone.utc):
+            return False
+    return True
+
+
+def _position_size_for_asset(positions, asset: str) -> float:
+    if not positions or not asset:
+        return 0.0
+    for position in positions:
+        if str(position.get("asset")) == str(asset):
+            try:
+                return max(float(position.get("size") or 0), 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _my_position_size(condition_id: Optional[str], asset: str) -> float:
+    positions = fetch_player_positions(user_address=config.POLY_FUNDER, condition_id=condition_id)
+    return _position_size_for_asset(positions, asset)
 
 
 def _notify_copy_trade(
@@ -154,21 +260,25 @@ async def handle_new_trade(payload):
         if price <= 0:
             logger.warning(f"Skipping trade with invalid price: {transaction_hash}")
             return None
+        if not _market_is_open(record):
+            return None
 
         logger.info(f"Copying trade from target: {proxy_wallet[:10]}... | {title} | {side}")
 
         if side == SELL:
             logger.info("Side is SELL, calculating proportional size...")
             data_trader = fetch_player_positions(user_address=proxy_wallet, condition_id=condition_id)
-            data_myself = fetch_player_positions(user_address=config.POLY_FUNDER, condition_id=condition_id)
+            my_current_size = _my_position_size(condition_id, token_id)
 
-            if data_trader and data_myself:
-                size_trader = float(data_trader[0].get("size", 0))
-                size_myself = float(data_myself[0].get("size", 0))
+            if data_trader and my_current_size > 0:
+                size_trader = _position_size_for_asset(data_trader, token_id)
 
                 if size_trader > 0:
                     percentage_position = usdc_size / size_trader
-                    final_size = percentage_position * size_myself
+                    final_size = min(percentage_position * my_current_size, my_current_size)
+                    if final_size <= 0:
+                        logger.info(f"Skipping SELL {transaction_hash}; no sellable position for {token_id}")
+                        return None
                     logger.info(f"Selling {percentage_position*100:.2f}% of position: {final_size:.2f} units")
                     if not claim_trade(
                         transaction_hash,
@@ -208,6 +318,14 @@ async def handle_new_trade(payload):
                         realized_pnl=realized_pnl,
                     )
                     return resp
+            logger.info(f"Skipping SELL {transaction_hash}; no matching bot position for {token_id}")
+            return None
+
+        if side != BUY:
+            logger.info(f"Skipping unsupported trade side {side}: {transaction_hash}")
+            return None
+
+        if not _is_fresh_startup_buy(record):
             return None
 
         bot_usdc_size = sizing_constraints(usdc_size)
@@ -271,31 +389,11 @@ async def handle_new_position(payload):
         if avg_price <= 0:
             logger.warning(f"Skipping position with invalid avg_price: {asset}")
             return None
+        if not _market_is_open(record):
+            return None
 
         logger.info(f"New position from target: {proxy_wallet[:10]}... | {title}")
-
-        bot_usdc_value = sizing_constraints(initial_value)
-        if bot_usdc_value > 0:
-            total_exp, market_exps = get_current_exposures(config.POLY_FUNDER)
-            t_exp = trader_exposure(proxy_wallet)
-            if check_risk_constraints(
-                total_exp,
-                bot_usdc_value,
-                market_exposure=market_exps.get(asset, 0),
-                trader_exposure=t_exp,
-            ):
-                bot_size_units = bot_usdc_value / avg_price
-                resp = make_order(price=avg_price, size=bot_size_units, side=BUY, token_id=asset)
-                _notify_copy_trade(
-                    side=BUY,
-                    price=avg_price,
-                    units=bot_size_units,
-                    usdc_value=bot_usdc_value,
-                    title=title,
-                    source_wallet=proxy_wallet,
-                    resp=resp,
-                )
-                return resp
+        logger.info("Skipping position-created BUY; BUY copies require fresh history trade timestamps")
         return None
     except Exception as e:
         logger.error(f"Error in handle_new_position: {e}")
@@ -329,6 +427,8 @@ async def handle_update_position(payload):
         if cur_price <= 0:
             logger.warning(f"Skipping position update with invalid cur_price: {asset}")
             return None
+        if not _market_is_open(new_record):
+            return None
 
         delta_value = new_value - old_value
         if abs(delta_value) < 1.0:
@@ -337,42 +437,20 @@ async def handle_update_position(payload):
         logger.info(f"Update from target: {proxy_wallet[:10]}... | {title} | Delta: ${delta_value:+.2f}")
 
         if delta_value > 0:
-            sized_delta = sizing_constraints(abs(delta_value))
-            if sized_delta <= 0:
-                return None
-            total_exp, market_exps = get_current_exposures(config.POLY_FUNDER)
-            t_exp = trader_exposure(proxy_wallet)
-            if check_risk_constraints(
-                total_exp,
-                sized_delta,
-                market_exposure=market_exps.get(asset, 0),
-                trader_exposure=t_exp,
-            ):
-                bot_size_units = sized_delta / cur_price
-                resp = make_order(price=cur_price, size=bot_size_units, side=BUY, token_id=asset)
-                _notify_copy_trade(
-                    side=BUY,
-                    price=cur_price,
-                    units=bot_size_units,
-                    usdc_value=sized_delta,
-                    title=title,
-                    source_wallet=proxy_wallet,
-                    resp=resp,
-                )
-                return resp
+            logger.info("Skipping position-increase BUY; BUY copies require fresh history trade timestamps")
+            return None
 
         old_size_trader = float(old_record.get("size", 1))
         new_size_trader = float(new_record.get("size", 0))
         if old_size_trader <= 0:
             return None
-        data_myself = fetch_player_positions(
-            user_address=config.POLY_FUNDER,
-            condition_id=new_record.get("condition_id"),
-        )
-        if data_myself:
-            my_current_size = float(data_myself[0].get("size", 0))
+        my_current_size = _my_position_size(new_record.get("condition_id"), asset)
+        if my_current_size > 0:
             reduction_pct = (old_size_trader - new_size_trader) / old_size_trader
-            my_reduction_size = my_current_size * reduction_pct
+            my_reduction_size = min(my_current_size * reduction_pct, my_current_size)
+            if my_reduction_size <= 0:
+                logger.info(f"Skipping position SELL for {asset}; reduction size <= 0")
+                return None
             resp = make_order(price=cur_price, size=my_reduction_size, side=SELL, token_id=asset)
             _notify_copy_trade(
                 side=SELL,
@@ -393,6 +471,7 @@ async def handle_update_position(payload):
                 resp=resp,
             )
             return resp
+        logger.info(f"Skipping position SELL for {asset}; no matching bot position")
         return None
     except Exception as e:
         logger.error(f"Error in handle_update_position: {e}")
@@ -400,15 +479,29 @@ async def handle_update_position(payload):
 
 
 async def process_new_history(wallet: str) -> None:
+    is_initial_history_sync = count_historic_activities(wallet) == 0
     activities = fetch_history_activities(wallet, limit=500, offset=0)
     inserted = insert_history_batch(activities)
+    if is_initial_history_sync:
+        logger.info(
+            f"Seeded {len(inserted)} historic activities for {wallet[:10]}...; "
+            "skipping copy actions for baseline history"
+        )
+        return
     for record in inserted:
         await handle_new_trade(_payload(record))
 
 
 async def process_position_changes(wallet: str) -> None:
+    is_initial_position_sync = count_positions(wallet) == 0
     positions = fetch_player_positions(user_address=wallet, limit=50, offset=0)
     events = insert_player_positions_batch(positions)
+    if is_initial_position_sync:
+        logger.info(
+            f"Seeded {len(events)} positions for {wallet[:10]}...; "
+            "skipping copy actions for baseline positions"
+        )
+        return
     for event in events:
         if event["event"] == "insert":
             await handle_new_position(_payload(event["record"]))
@@ -431,9 +524,9 @@ async def run_polling_loop():
                 logger.error(f"Error polling wallet {wallet}: {traceback.format_exc()}")
 
         if now >= next_positions_poll:
-            next_positions_poll = time.monotonic() + 60 * 5
+            next_positions_poll = time.monotonic() + config.POSITIONS_POLL_INTERVAL_SECONDS
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(config.HISTORY_POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

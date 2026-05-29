@@ -1,9 +1,10 @@
 """Telegram notification module with hourly summary reports."""
 
 import os
+import queue
 import time
+import urllib.error
 import urllib.request
-import urllib.parse
 import json
 import threading
 
@@ -14,6 +15,10 @@ class TelegramNotifier:
         self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
         self.title_suffix = os.getenv("TELEGRAM_TITLE_SUFFIX", "_EUWEST1")
         self.enabled = bool(self.bot_token and self.chat_id)
+        self.min_interval = float(os.getenv("TELEGRAM_MIN_INTERVAL_SECONDS", "1.2"))
+        self._queue = queue.Queue()
+        self._worker_started = False
+        self._worker_lock = threading.Lock()
         if not self.enabled:
             print("[telegram] No token/chat_id configured — notifications disabled")
 
@@ -21,9 +26,15 @@ class TelegramNotifier:
         if not self.enabled:
             return
         message = self._add_title_suffix(message)
-        threading.Thread(
-            target=self._send_sync, args=(message, silent), daemon=True
-        ).start()
+        self._queue.put((message, silent))
+        self._ensure_worker()
+
+    def _ensure_worker(self):
+        with self._worker_lock:
+            if self._worker_started:
+                return
+            threading.Thread(target=self._send_worker, daemon=True).start()
+            self._worker_started = True
 
     def _add_title_suffix(self, message: str) -> str:
         suffix = self.title_suffix.strip()
@@ -43,6 +54,15 @@ class TelegramNotifier:
         lines[0] = first + suffix
         return "\n".join(lines)
 
+    def _send_worker(self):
+        while True:
+            message, silent = self._queue.get()
+            try:
+                self._send_sync(message, silent)
+            finally:
+                self._queue.task_done()
+                time.sleep(self.min_interval)
+
     def _send_sync(self, message: str, silent: bool):
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = json.dumps({
@@ -58,12 +78,39 @@ class TelegramNotifier:
                 )
                 urllib.request.urlopen(req, timeout=10)
                 return
+            except urllib.error.HTTPError as e:
+                retry_after = self._retry_after_seconds(e)
+                if e.code == 429 and retry_after:
+                    print(f"[telegram] Rate limited; retrying after {retry_after:.1f}s")
+                    time.sleep(retry_after)
+                    continue
+                if attempt >= 3:
+                    print(f"[telegram] Failed to send after 3 attempts: {e}")
+                    return
+                print(f"[telegram] Send attempt {attempt}/3 failed: {e}; retrying...")
+                time.sleep(2 * attempt)
             except Exception as e:
                 if attempt >= 3:
                     print(f"[telegram] Failed to send after 3 attempts: {e}")
                     return
                 print(f"[telegram] Send attempt {attempt}/3 failed: {e}; retrying...")
                 time.sleep(2 * attempt)
+
+    def _retry_after_seconds(self, error: urllib.error.HTTPError) -> float:
+        header = error.headers.get("Retry-After") if error.headers else None
+        if header:
+            try:
+                return max(float(header), self.min_interval)
+            except ValueError:
+                pass
+
+        try:
+            body = error.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            retry_after = data.get("parameters", {}).get("retry_after", 0)
+            return max(float(retry_after), self.min_interval)
+        except Exception:
+            return 0.0
 
     def trade_alert(self, side: str, price: float, amount: float, market_slug: str, dry_run: bool, edge: float = 0, kelly_size: float = 0):
         mode = "PAPER" if dry_run else "LIVE"

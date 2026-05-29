@@ -163,6 +163,24 @@ def insert_historic_activities(activities: Iterable[dict]) -> list[dict]:
     return inserted
 
 
+def count_historic_activities(proxy_wallet: str) -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM historic_trades WHERE lower(proxy_wallet) = ?",
+            (proxy_wallet.lower(),),
+        ).fetchone()
+    return int(row["count"] or 0)
+
+
+def count_positions(proxy_wallet: str) -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM polymarket_positions WHERE lower(proxy_wallet) = ?",
+            (proxy_wallet.lower(),),
+        ).fetchone()
+    return int(row["count"] or 0)
+
+
 def _get_position(conn: sqlite3.Connection, proxy_wallet: str, asset: str) -> Optional[dict]:
     row = conn.execute(
         "SELECT * FROM polymarket_positions WHERE proxy_wallet = ? AND asset = ?",

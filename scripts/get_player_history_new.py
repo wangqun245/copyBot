@@ -2,6 +2,7 @@ from datetime import datetime
 from config import get_config
 from db import insert_historic_activities
 from http_client import get_json
+from logger import logger
 
 # Load configuration
 config = get_config()
@@ -66,11 +67,7 @@ def fetch_activities(user_address: str, limit: int = 500, offset: int = 0):
         timeout=10,
     )
     db_activities = [transform_activity_to_db_format(activity) for activity in data]
-    # print('db_activities', db_activities[0])
-    print('===============================================')
-    print('fetching activities from', user_address)
-    print('db_activities length', len(db_activities))
-    print('===============================================')
+    logger.debug(f"Fetched {len(db_activities)} activities for {user_address}")
     return db_activities
 
 
@@ -86,7 +83,7 @@ def insert_activities_batch(activities: list):
     inserted = insert_historic_activities(activities)
     skipped = len(activities) - len(inserted)
     if skipped:
-        print(f"Skipped {skipped} duplicate activities")
+        logger.debug(f"Skipped {skipped} duplicate activities")
     return inserted
 
 if __name__ == "__main__":
