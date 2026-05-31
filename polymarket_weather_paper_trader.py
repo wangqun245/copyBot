@@ -1305,12 +1305,27 @@ def active_strategy_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
     return effective_configs
 
 
-def strategy_due(strategy_config: dict[str, Any], now: datetime) -> bool:
+def strategy_due(
+    strategy_config: dict[str, Any],
+    now: datetime,
+    last_run_at: dict[str, datetime],
+) -> tuple[bool, str]:
     meta = strategy_config.get("_strategy_meta", {})
+    name = str(meta.get("name") or strategy_config["trading"]["strategy_name"])
     interval = int(meta.get("run_every_minutes", 15))
+
     if meta.get("align_to_top_of_hour", False) and now.minute != 0:
-        return False
-    return (now.minute % interval) == 0
+        return False, "waiting_for_top_of_hour"
+
+    previous = last_run_at.get(name)
+    if previous is None:
+        return True, "first_run"
+
+    elapsed_seconds = (now - previous).total_seconds()
+    interval_seconds = interval * 60
+    if elapsed_seconds >= interval_seconds:
+        return True, f"elapsed_{int(elapsed_seconds)}s"
+    return False, f"only_elapsed_{int(elapsed_seconds)}s"
 
 
 def run_strategy_cycle(config: dict[str, Any], cycle_id: str) -> int:
@@ -1670,16 +1685,18 @@ def run_strategy_cycle(config: dict[str, Any], cycle_id: str) -> int:
     return len(all_new_trades)
 
 
-def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
+def run_cycle(config: dict[str, Any], cycle_num: int, last_run_at: dict[str, datetime]) -> int:
     now = datetime.now()
     base_cycle_id = now.strftime("%Y%m%dT%H%M%S") + f"-{cycle_num}"
     total_new_trades = 0
     for strategy_config in active_strategy_configs(config):
         strategy_name = strategy_config["trading"]["strategy_name"]
-        if not strategy_due(strategy_config, now):
-            LOGGER.info("[%s] strategy=%s not due", base_cycle_id, strategy_name)
+        due, reason = strategy_due(strategy_config, now, last_run_at)
+        if not due:
+            LOGGER.info("[%s] strategy=%s not due reason=%s", base_cycle_id, strategy_name, reason)
             continue
         total_new_trades += run_strategy_cycle(strategy_config, f"{base_cycle_id}:{strategy_name}")
+        last_run_at[strategy_name] = now
     return total_new_trades
 
 
@@ -1720,11 +1737,12 @@ def summarize_settled(config: dict[str, Any]) -> None:
 
 def run(config: dict[str, Any]) -> None:
     cycle_num = 0
+    last_run_at: dict[str, datetime] = {}
     max_cycles = int(config["scheduler"]["max_cycles"])
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
     while True:
         cycle_num += 1
-        run_cycle(config, cycle_num)
+        run_cycle(config, cycle_num, last_run_at)
         process_strategy_exits(config)
         if config["scheduler"]["settle_after_each_cycle"]:
             settle_open_trades(config)
