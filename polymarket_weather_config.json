@@ -69,7 +69,9 @@
   },
   "trading": {
     "strategy_name": "twc_every_15m_most_likely",
+    "strategy_mode": "intraday_reactive",
     "buy_notional_usdc": 5.0,
+    "mispricing_price_threshold": 0.5,
     "fee_rate": 0.05,
     "fee_enabled": true,
     "one_trade_per_event_per_cycle": true,
@@ -77,10 +79,12 @@
     "lowest_local_hour_window": "0-6",
     "highest_local_hour_window": "12-18",
     "forecast_horizon_hours": 6,
+    "forecast_scope": "next_hours_plus_observed",
     "include_observed_today": true
   },
   "scheduler": {
     "poll_interval_minutes": 15,
+    "align_to_top_of_hour": false,
     "run_once": false,
     "max_cycles": 0,
     "settle_after_each_cycle": true,
@@ -96,5 +100,46 @@
     "log_file": "bot.log",
     "log_level": "INFO",
     "console_log_enabled": false
-  }
+  },
+  "strategies": [
+    {
+      "name": "intraday_reactive",
+      "enabled": true,
+      "run_every_minutes": 15,
+      "align_to_top_of_hour": false,
+      "events": {
+        "target_dates": ["today"]
+      },
+      "trading": {
+        "strategy_name": "intraday_reactive",
+        "strategy_mode": "intraday_reactive",
+        "mispricing_price_threshold": 0.5,
+        "time_windows_enabled": true,
+        "lowest_local_hour_window": "0-6",
+        "highest_local_hour_window": "12-18",
+        "forecast_scope": "next_hours_plus_observed",
+        "forecast_horizon_hours": 6,
+        "include_observed_today": true
+      }
+    },
+    {
+      "name": "tomorrow_mispricing",
+      "enabled": true,
+      "run_every_minutes": 60,
+      "align_to_top_of_hour": true,
+      "events": {
+        "target_dates": ["tomorrow"]
+      },
+      "trading": {
+        "strategy_name": "tomorrow_mispricing",
+        "strategy_mode": "tomorrow_mispricing",
+        "mispricing_price_threshold": 0.5,
+        "time_windows_enabled": true,
+        "tomorrow_mispricing_local_hour_window": "12-24",
+        "forecast_scope": "event_day_full",
+        "forecast_horizon_hours": 6,
+        "include_observed_today": false
+      }
+    }
+  ]
 }

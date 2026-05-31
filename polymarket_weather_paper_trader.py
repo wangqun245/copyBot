@@ -98,11 +98,18 @@ class PaperTrade:
     comparable_rule_max: Optional[float]
     comparable_unit: str
     yes_price: Optional[float]
+    mispricing_price_threshold: float
+    pricing_edge: float
     notional_usdc: float
     shares: float
     taker_fee_rate: float
     buy_fee_usdc: float
     total_cost_usdc: float
+    exit_at: str = ""
+    exit_reason: str = ""
+    exit_yes_price: Optional[float] = None
+    exit_fee_usdc: float = 0.0
+    exit_proceeds_usdc: float = 0.0
     status: str = "OPEN"
     settlement_source: str = ""
     winning_outcome: str = ""
@@ -193,7 +200,9 @@ def default_config() -> dict[str, Any]:
         },
         "trading": {
             "strategy_name": "twc_every_15m_most_likely",
+            "strategy_mode": "intraday_reactive",
             "buy_notional_usdc": 5.0,
+            "mispricing_price_threshold": 0.5,
             "fee_rate": 0.05,
             "fee_enabled": True,
             "one_trade_per_event_per_cycle": True,
@@ -201,10 +210,12 @@ def default_config() -> dict[str, Any]:
             "lowest_local_hour_window": "0-6",
             "highest_local_hour_window": "12-18",
             "forecast_horizon_hours": 6,
+            "forecast_scope": "next_hours_plus_observed",
             "include_observed_today": True,
         },
         "scheduler": {
             "poll_interval_minutes": 15,
+            "align_to_top_of_hour": False,
             "run_once": False,
             "max_cycles": 0,
             "settle_after_each_cycle": True,
@@ -221,6 +232,43 @@ def default_config() -> dict[str, Any]:
             "log_level": "INFO",
             "console_log_enabled": False,
         },
+        "strategies": [
+            {
+                "name": "intraday_reactive",
+                "enabled": True,
+                "run_every_minutes": 15,
+                "align_to_top_of_hour": False,
+                "events": {"target_dates": ["today"]},
+                "trading": {
+                    "strategy_name": "intraday_reactive",
+                    "strategy_mode": "intraday_reactive",
+                    "mispricing_price_threshold": 0.5,
+                    "time_windows_enabled": True,
+                    "lowest_local_hour_window": "0-6",
+                    "highest_local_hour_window": "12-18",
+                    "forecast_scope": "next_hours_plus_observed",
+                    "forecast_horizon_hours": 6,
+                    "include_observed_today": True,
+                },
+            },
+            {
+                "name": "tomorrow_mispricing",
+                "enabled": True,
+                "run_every_minutes": 60,
+                "align_to_top_of_hour": True,
+                "events": {"target_dates": ["tomorrow"]},
+                "trading": {
+                    "strategy_name": "tomorrow_mispricing",
+                    "strategy_mode": "tomorrow_mispricing",
+                    "mispricing_price_threshold": 0.5,
+                    "time_windows_enabled": True,
+                    "tomorrow_mispricing_local_hour_window": "12-24",
+                    "forecast_scope": "event_day_full",
+                    "forecast_horizon_hours": 6,
+                    "include_observed_today": False,
+                },
+            },
+        ],
     }
 
 
@@ -545,7 +593,9 @@ def trading_window_status(config: dict[str, Any], kind: str, local_dt: Optional[
     if local_dt is None:
         return False, "", "missing_twc_local_time"
 
-    if kind == "Lowest":
+    if config["trading"].get("strategy_mode") == "tomorrow_mispricing":
+        window_text = str(config["trading"].get("tomorrow_mispricing_local_hour_window", "12-24"))
+    elif kind == "Lowest":
         window_text = str(config["trading"]["lowest_local_hour_window"])
     else:
         window_text = str(config["trading"]["highest_local_hour_window"])
@@ -626,6 +676,19 @@ def summarize_twc_daily_forecast(payload: dict[str, Any], event_date: str) -> tu
         matched[0][0].isoformat(),
         matched[-1][0].isoformat(),
     )
+
+
+def daily_twc_points(payload: dict[str, Any], event_date: str) -> list[tuple[datetime, float]]:
+    temps = payload.get("temperature") or []
+    times = payload.get("validTimeLocal") or []
+    matched: list[tuple[datetime, float]] = []
+    for idx, raw_time in enumerate(times):
+        if idx >= len(temps) or temps[idx] is None:
+            continue
+        local_dt = parse_twc_local_time(str(raw_time))
+        if local_dt and local_dt.date().isoformat() == event_date:
+            matched.append((local_dt, float(temps[idx])))
+    return sorted(matched, key=lambda item: item[0])
 
 
 def filtered_twc_points(
@@ -838,6 +901,7 @@ def build_trade(
     forecast_unit = (market.unit or twc_forecast_unit(config)).upper()
     comparable_min, comparable_max, comparable_unit = comparable_rule_bounds(market, forecast_unit)
     notional = float(config["trading"]["buy_notional_usdc"])
+    threshold = float(config["trading"].get("mispricing_price_threshold", 1.0))
     price = float(market.yes_price or 0.0)
     shares = notional / price if price > 0 else 0.0
     fee = taker_fee_usdc(
@@ -878,6 +942,8 @@ def build_trade(
         comparable_rule_max=comparable_max,
         comparable_unit=comparable_unit,
         yes_price=market.yes_price,
+        mispricing_price_threshold=threshold,
+        pricing_edge=round(1.0 - price, 8),
         notional_usdc=round(notional, 6),
         shares=round(shares, 8),
         taker_fee_rate=float(config["trading"]["fee_rate"]),
@@ -920,11 +986,16 @@ def read_trades(path: str) -> list[PaperTrade]:
                 "comparable_rule_min",
                 "comparable_rule_max",
                 "yes_price",
+                "mispricing_price_threshold",
+                "pricing_edge",
                 "notional_usdc",
                 "shares",
                 "taker_fee_rate",
                 "buy_fee_usdc",
                 "total_cost_usdc",
+                "exit_yes_price",
+                "exit_fee_usdc",
+                "exit_proceeds_usdc",
                 "payout_usdc",
                 "pnl_usdc",
             }:
@@ -936,7 +1007,19 @@ def read_trades(path: str) -> list[PaperTrade]:
         cleaned.setdefault("comparable_rule_min", None)
         cleaned.setdefault("comparable_rule_max", None)
         cleaned.setdefault("comparable_unit", cleaned.get("forecast_unit", ""))
-        for field in {"notional_usdc", "shares", "taker_fee_rate", "buy_fee_usdc", "total_cost_usdc", "payout_usdc", "pnl_usdc"}:
+        cleaned.setdefault("exit_at", "")
+        cleaned.setdefault("exit_reason", "")
+        for field in {
+            "notional_usdc",
+            "shares",
+            "taker_fee_rate",
+            "buy_fee_usdc",
+            "total_cost_usdc",
+            "exit_fee_usdc",
+            "exit_proceeds_usdc",
+            "payout_usdc",
+            "pnl_usdc",
+        }:
             cleaned[field] = float(cleaned[field] or 0.0)
         trades.append(PaperTrade(**cleaned))
     return trades
@@ -956,8 +1039,8 @@ def pct(numerator: float, denominator: float) -> float:
 
 
 def performance_row(group_name: str, group_value: str, rows: list[PaperTrade]) -> dict[str, Any]:
-    settled = [t for t in rows if t.status == "SETTLED"]
-    open_rows = [t for t in rows if t.status != "SETTLED"]
+    settled = [t for t in rows if t.status in {"SETTLED", "SOLD"}]
+    open_rows = [t for t in rows if t.status not in {"SETTLED", "SOLD"}]
     total_notional = sum(t.notional_usdc for t in rows)
     total_fees = sum(t.buy_fee_usdc for t in rows)
     total_cost = sum(t.total_cost_usdc for t in rows)
@@ -991,7 +1074,7 @@ def write_performance_reports(config: dict[str, Any], trades: list[PaperTrade]) 
     by_event: dict[str, list[PaperTrade]] = {}
     for trade in trades:
         by_cycle.setdefault(trade.cycle_id, []).append(trade)
-        event_key = f"{trade.event_date}|{trade.city}|{trade.kind}"
+        event_key = f"{trade.strategy}|{trade.event_date}|{trade.city}|{trade.kind}"
         by_event.setdefault(event_key, []).append(trade)
 
     cycle_rows = [performance_row("cycle_id", key, rows) for key, rows in sorted(by_cycle.items())]
@@ -1002,6 +1085,7 @@ def write_performance_reports(config: dict[str, Any], trades: list[PaperTrade]) 
         row.update(
             {
                 "event_date": first.event_date,
+                "strategy": first.strategy,
                 "city": first.city,
                 "kind": first.kind,
                 "event_title": first.event_title,
@@ -1021,6 +1105,49 @@ def fetch_market_by_id(config: dict[str, Any], market_id: str) -> Optional[dict[
         return gamma_get(config, f"/markets/{market_id}")
     except requests.HTTPError:
         return None
+
+
+def fetch_event_by_trade(config: dict[str, Any], trade: PaperTrade) -> Optional[dict[str, Any]]:
+    slug = trade.polymarket_url.rstrip("/").split("/")[-1]
+    if not slug:
+        return None
+    try:
+        event = gamma_get(config, f"/events/slug/{slug}")
+    except requests.HTTPError:
+        return None
+    event["_parsed_kind"] = trade.kind
+    event["_parsed_city"] = trade.city
+    event["_parsed_event_date"] = trade.event_date
+    return event
+
+
+def evaluate_trade_forecast_market(config: dict[str, Any], trade: PaperTrade) -> Optional[TemperatureMarket]:
+    event = fetch_event_by_trade(config, trade)
+    if not event:
+        return None
+    markets = markets_for_event(config, event)
+    unit = (trade.market_unit or event_market_unit(markets)).upper()
+    twc_units = twc_units_for_temperature_unit(unit)
+    station = trade.forecast_station or station_from_wu_url(trade.wunderground_source_url)
+    if not station:
+        return None
+
+    payload = twc_hourly_forecast_by_icao(config, station, units=twc_units)
+    if config["trading"].get("forecast_scope") == "event_day_full":
+        forecast_points = daily_twc_points(payload, trade.event_date)
+    else:
+        forecast_points = filtered_twc_points(payload, trade.event_date, int(config["trading"]["forecast_horizon_hours"]))
+
+    observed_points: list[tuple[datetime, float]] = []
+    if config["trading"].get("include_observed_today", True) and datetime.strptime(trade.event_date, "%Y-%m-%d").date() <= date.today():
+        city_local_dt, _, _ = city_local_now(config, trade.city)
+        historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
+        observed_points = observed_twc_points(historical_payload, trade.event_date, city_local_dt)
+
+    combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
+    high, low, _, _, _, _ = summarize_points(combined_points)
+    forecasts_by_unit = {unit: {"high": high, "low": low}}
+    return choose_most_likely_market(markets, forecasts_by_unit, trade.kind)
 
 
 def resolved_outcome_from_market(market: dict[str, Any]) -> str:
@@ -1045,7 +1172,7 @@ def settle_open_trades(config: dict[str, Any]) -> list[PaperTrade]:
     market_cache: dict[str, Optional[dict[str, Any]]] = {}
     settled_now = 0
     for trade in trades:
-        if trade.status == "SETTLED":
+        if trade.status in {"SETTLED", "SOLD"}:
             continue
         market_cache.setdefault(trade.market_id, fetch_market_by_id(config, trade.market_id))
         outcome = resolved_outcome_from_market(market_cache[trade.market_id] or {})
@@ -1065,21 +1192,136 @@ def settle_open_trades(config: dict[str, Any]) -> list[PaperTrade]:
     return trades
 
 
+def process_strategy_exits(config: dict[str, Any]) -> list[PaperTrade]:
+    exit_config = next(
+        (
+            strategy_config
+            for strategy_config in active_strategy_configs(config)
+            if strategy_config["trading"].get("strategy_name") == "tomorrow_mispricing"
+        ),
+        config,
+    )
+    trades_path = config["outputs"]["trades_csv"]
+    trades = read_trades(trades_path)
+    if not trades:
+        LOGGER.info("exit check skipped: no trades found at %s", trades_path)
+        return []
+
+    exits_now = 0
+    market_cache: dict[str, Optional[dict[str, Any]]] = {}
+    for trade in trades:
+        if trade.status != "OPEN" or trade.strategy != "tomorrow_mispricing":
+            continue
+        try:
+            event_dt = datetime.strptime(trade.event_date, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if event_dt > date.today():
+            continue
+
+        market_cache.setdefault(trade.market_id, fetch_market_by_id(config, trade.market_id))
+        market = market_cache[trade.market_id] or {}
+        current_price = outcome_price(market, "Yes")
+        threshold = float(trade.mispricing_price_threshold or config["trading"].get("mispricing_price_threshold", 0.5))
+
+        exit_reason = ""
+        current_choice_id = ""
+        if current_price is not None and current_price >= threshold:
+            exit_reason = "price_reached_threshold"
+        else:
+            current_choice = evaluate_trade_forecast_market(exit_config, trade)
+            current_choice_id = current_choice.market_id if current_choice else ""
+            if current_choice and current_choice.market_id != trade.market_id:
+                exit_reason = f"forecast_invalidated_now_{current_choice.market_id}"
+
+        if not exit_reason or current_price is None:
+            continue
+
+        exit_fee = taker_fee_usdc(
+            trade.shares,
+            float(current_price),
+            float(trade.taker_fee_rate),
+            bool(exit_config["trading"]["fee_enabled"]),
+        )
+        proceeds = trade.shares * float(current_price) - exit_fee
+        trade.status = "SOLD"
+        trade.exit_at = datetime.now().isoformat(timespec="seconds")
+        trade.exit_reason = exit_reason
+        trade.exit_yes_price = float(current_price)
+        trade.exit_fee_usdc = round(exit_fee, 8)
+        trade.exit_proceeds_usdc = round(proceeds, 8)
+        trade.payout_usdc = round(proceeds, 8)
+        trade.pnl_usdc = round(proceeds - trade.total_cost_usdc, 8)
+        exits_now += 1
+        LOGGER.info(
+            "exit strategy=tomorrow_mispricing trade=%s city=%s kind=%s bought_market=%s current_choice=%s exit_price=%s threshold=%s reason=%s shares=%s exit_fee=%s proceeds=%s total_cost=%s pnl=%s",
+            trade.trade_id,
+            trade.city,
+            trade.kind,
+            trade.market_id,
+            current_choice_id,
+            current_price,
+            threshold,
+            exit_reason,
+            trade.shares,
+            trade.exit_fee_usdc,
+            trade.exit_proceeds_usdc,
+            trade.total_cost_usdc,
+            trade.pnl_usdc,
+        )
+
+    write_csv(trades_path, trades)
+    write_csv(config["outputs"]["settled_trades_csv"], trades)
+    write_performance_reports(config, trades)
+    LOGGER.info("exit check complete: trades=%s exits=%s", len(trades), exits_now)
+    return trades
+
+
 def all_events_settled(events: list[dict[str, Any]]) -> bool:
     if not events:
         return False
     return all(parse_bool(e.get("closed")) for e in events)
 
 
-def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
-    cycle_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"-{cycle_num}"
+def active_strategy_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
+    strategies = config.get("strategies") or []
+    if not strategies:
+        return [config]
+
+    effective_configs: list[dict[str, Any]] = []
+    for strategy in strategies:
+        if not strategy.get("enabled", True):
+            continue
+        overrides = {k: v for k, v in strategy.items() if k not in {"name", "enabled", "run_every_minutes", "align_to_top_of_hour"}}
+        effective = deep_merge(config, overrides)
+        effective["strategies"] = []
+        effective["_strategy_meta"] = {
+            "name": strategy.get("name") or effective["trading"].get("strategy_name", "strategy"),
+            "run_every_minutes": int(strategy.get("run_every_minutes", config["scheduler"]["poll_interval_minutes"])),
+            "align_to_top_of_hour": bool(strategy.get("align_to_top_of_hour", False)),
+        }
+        effective["trading"]["strategy_name"] = effective["_strategy_meta"]["name"]
+        effective_configs.append(effective)
+    return effective_configs
+
+
+def strategy_due(strategy_config: dict[str, Any], now: datetime) -> bool:
+    meta = strategy_config.get("_strategy_meta", {})
+    interval = int(meta.get("run_every_minutes", 15))
+    if meta.get("align_to_top_of_hour", False) and now.minute != 0:
+        return False
+    return (now.minute % interval) == 0
+
+
+def run_strategy_cycle(config: dict[str, Any], cycle_id: str) -> int:
     target_dates = [resolve_date(str(v)) for v in config["events"]["target_dates"]]
     all_new_trades: list[PaperTrade] = []
     snapshot_rows: list[dict[str, Any]] = []
+    strategy_name = str(config["trading"]["strategy_name"])
 
     for target in target_dates:
         events = discover_temperature_events(config, target)
-        log_info(f"[{cycle_id}] {target.isoformat()} events={len(events)}")
+        log_info(f"[{cycle_id}] strategy={strategy_name} target={target.isoformat()} events={len(events)}")
 
         for event in events:
             markets = markets_for_event(config, event)
@@ -1098,6 +1340,7 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                     snapshot_rows.append(
                         {
                             "cycle_id": cycle_id,
+                            "strategy": strategy_name,
                             "observed_at": observed_at,
                             "target_date": target.isoformat(),
                             "city": event["_parsed_city"],
@@ -1133,6 +1376,9 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                             "chosen_condition_id": "",
                             "chosen_question": "",
                             "chosen_yes_price": "",
+                            "mispricing_price_threshold": "",
+                            "pricing_edge": "",
+                            "should_buy": False,
                             "chosen_rule_min": "",
                             "chosen_rule_max": "",
                             "chosen_market_unit": "",
@@ -1175,10 +1421,13 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
 
                 horizon_hours = int(config["trading"]["forecast_horizon_hours"])
                 payload = twc_hourly_forecast_by_icao(config, station, units=twc_units)
-                forecast_points = filtered_twc_points(payload, event["_parsed_event_date"], horizon_hours)
+                if config["trading"].get("forecast_scope") == "event_day_full":
+                    forecast_points = daily_twc_points(payload, event["_parsed_event_date"])
+                else:
+                    forecast_points = filtered_twc_points(payload, event["_parsed_event_date"], horizon_hours)
                 observed_points: list[tuple[datetime, float]] = []
                 historical_payload: dict[str, Any] = {}
-                if config["trading"].get("include_observed_today", True):
+                if config["trading"].get("include_observed_today", True) and target == date.today():
                     historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
                     observed_points = observed_twc_points(historical_payload, event["_parsed_event_date"], city_local_dt)
                 combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
@@ -1207,6 +1456,8 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                 forecast_temp = high if event["_parsed_kind"] == "Highest" else low
                 forecast_unit = event_unit
                 chosen = choose_most_likely_market(markets, forecasts_by_unit, event["_parsed_kind"])
+                price_threshold = float(config["trading"].get("mispricing_price_threshold", 1.0))
+                should_buy = bool(chosen and chosen.yes_price is not None and chosen.yes_price < price_threshold)
                 if chosen:
                     forecast_temp, forecast_high, forecast_low, forecast_unit = native_forecast_for_market(
                         forecasts_by_unit,
@@ -1223,6 +1474,7 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                 snapshot_rows.append(
                     {
                         "cycle_id": cycle_id,
+                        "strategy": strategy_name,
                         "observed_at": observed_at,
                         "target_date": target.isoformat(),
                         "city": event["_parsed_city"],
@@ -1258,6 +1510,9 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "chosen_condition_id": chosen.condition_id if chosen else "",
                         "chosen_question": chosen.market_question if chosen else "",
                         "chosen_yes_price": chosen.yes_price if chosen else "",
+                        "mispricing_price_threshold": price_threshold,
+                        "pricing_edge": round(1.0 - float(chosen.yes_price), 8) if chosen and chosen.yes_price is not None else "",
+                        "should_buy": should_buy,
                         "chosen_rule_min": chosen.rule_min if chosen else "",
                         "chosen_rule_max": chosen.rule_max if chosen else "",
                         "chosen_market_unit": chosen.unit if chosen else "",
@@ -1283,24 +1538,25 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                     }
                 )
 
-                if chosen:
-                    all_new_trades.append(
-                        build_trade(
-                            config,
-                            cycle_id,
-                            chosen,
-                            wu_source,
-                            station,
-                            forecast_temp,
-                            forecast_high,
-                            forecast_low,
-                            first_local,
-                            last_local,
-                        )
-                    )
-                    LOGGER.info(
-                        "[%s] buy city=%s kind=%s station=%s forecast=%s%s market=%s price=%s market_unit=%s comparable_rule=%s-%s%s",
+                if should_buy and chosen:
+                    new_trade = build_trade(
+                        config,
                         cycle_id,
+                        chosen,
+                        wu_source,
+                        station,
+                        forecast_temp,
+                        forecast_high,
+                        forecast_low,
+                        first_local,
+                        last_local,
+                    )
+                    all_new_trades.append(new_trade)
+                    LOGGER.info(
+                        "[%s] buy strategy=%s trade=%s city=%s kind=%s station=%s forecast=%s%s market=%s price=%s threshold=%s edge=%s notional=%s shares=%s buy_fee=%s total_cost=%s market_unit=%s comparable_rule=%s-%s%s",
+                        cycle_id,
+                        strategy_name,
+                        new_trade.trade_id,
                         event["_parsed_city"],
                         event["_parsed_kind"],
                         station,
@@ -1308,6 +1564,12 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         forecast_unit,
                         chosen.market_id,
                         chosen.yes_price,
+                        price_threshold,
+                        new_trade.pricing_edge,
+                        new_trade.notional_usdc,
+                        new_trade.shares,
+                        new_trade.buy_fee_usdc,
+                        new_trade.total_cost_usdc,
                         chosen.unit,
                         comparable_min,
                         comparable_max,
@@ -1316,13 +1578,15 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                 else:
                     log_method = LOGGER.info if not window_allowed else LOGGER.warning
                     log_method(
-                        "[%s] skip city=%s kind=%s forecast=%s reason=%s local_time=%s",
+                        "[%s] skip city=%s kind=%s forecast=%s reason=%s local_time=%s price=%s threshold=%s",
                         cycle_id,
                         event["_parsed_city"],
                         event["_parsed_kind"],
                         forecast_temp,
-                        window_reason if not window_allowed else "no_usable_market",
+                        window_reason if not window_allowed else ("price_above_threshold" if chosen else "no_usable_market"),
                         city_local_dt.isoformat() if city_local_dt else "",
+                        chosen.yes_price if chosen else "",
+                        price_threshold,
                     )
             except Exception as exc:
                 LOGGER.exception(
@@ -1335,6 +1599,7 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                 snapshot_rows.append(
                     {
                         "cycle_id": cycle_id,
+                        "strategy": strategy_name,
                         "observed_at": datetime.now().isoformat(timespec="seconds"),
                         "target_date": target.isoformat(),
                         "city": event.get("_parsed_city", ""),
@@ -1370,6 +1635,9 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "chosen_condition_id": "",
                         "chosen_question": "",
                         "chosen_yes_price": "",
+                        "mispricing_price_threshold": "",
+                        "pricing_edge": "",
+                        "should_buy": "",
                         "chosen_rule_min": "",
                         "chosen_rule_max": "",
                         "chosen_market_unit": "",
@@ -1398,8 +1666,21 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
 
     append_csv(config["outputs"]["snapshots_csv"], snapshot_rows)
     append_csv(config["outputs"]["trades_csv"], [asdict(t) for t in all_new_trades])
-    log_info(f"[{cycle_id}] snapshots={len(snapshot_rows)} new_trades={len(all_new_trades)}")
+    log_info(f"[{cycle_id}] strategy={strategy_name} snapshots={len(snapshot_rows)} new_trades={len(all_new_trades)}")
     return len(all_new_trades)
+
+
+def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
+    now = datetime.now()
+    base_cycle_id = now.strftime("%Y%m%dT%H%M%S") + f"-{cycle_num}"
+    total_new_trades = 0
+    for strategy_config in active_strategy_configs(config):
+        strategy_name = strategy_config["trading"]["strategy_name"]
+        if not strategy_due(strategy_config, now):
+            LOGGER.info("[%s] strategy=%s not due", base_cycle_id, strategy_name)
+            continue
+        total_new_trades += run_strategy_cycle(strategy_config, f"{base_cycle_id}:{strategy_name}")
+    return total_new_trades
 
 
 def write_state(config: dict[str, Any], cycle_num: int) -> None:
@@ -1422,8 +1703,8 @@ def summarize_settled(config: dict[str, Any]) -> None:
     trades = read_trades(config["outputs"]["settled_trades_csv"])
     if not trades:
         return
-    settled = [t for t in trades if t.status == "SETTLED"]
-    open_trades = [t for t in trades if t.status != "SETTLED"]
+    settled = [t for t in trades if t.status in {"SETTLED", "SOLD"}]
+    open_trades = [t for t in trades if t.status not in {"SETTLED", "SOLD"}]
     settled_cost = sum(t.total_cost_usdc for t in settled)
     open_cost = sum(t.total_cost_usdc for t in open_trades)
     total_cost = settled_cost + open_cost
@@ -1444,6 +1725,7 @@ def run(config: dict[str, Any]) -> None:
     while True:
         cycle_num += 1
         run_cycle(config, cycle_num)
+        process_strategy_exits(config)
         if config["scheduler"]["settle_after_each_cycle"]:
             settle_open_trades(config)
             summarize_settled(config)
@@ -1457,7 +1739,12 @@ def run(config: dict[str, Any]) -> None:
 
         if config["scheduler"]["run_once"] or (max_cycles and cycle_num >= max_cycles):
             break
-        sleep_seconds = int(config["scheduler"]["poll_interval_minutes"]) * 60
+        if config["scheduler"].get("align_to_top_of_hour", False):
+            now = datetime.now()
+            next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+            sleep_seconds = max(1, int((next_hour - now).total_seconds()))
+        else:
+            sleep_seconds = int(config["scheduler"]["poll_interval_minutes"]) * 60
         log_info(f"sleeping {sleep_seconds} seconds")
         time.sleep(sleep_seconds)
 
