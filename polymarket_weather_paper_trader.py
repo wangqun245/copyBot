@@ -502,13 +502,14 @@ def trading_window_status(config: dict[str, Any], kind: str, local_dt: Optional[
     return allowed, window_text, reason
 
 
-def twc_hourly_forecast_by_icao(config: dict[str, Any], icao_code: str) -> dict[str, Any]:
+def twc_hourly_forecast_by_icao(config: dict[str, Any], icao_code: str, units: Optional[str] = None) -> dict[str, Any]:
+    request_units = units or config["api"]["twc_units"]
     return twc_get(
         config,
         f"/v3/wx/forecast/hourly/{config['api']['twc_duration']}",
         {
             "icaoCode": icao_code,
-            "units": config["api"]["twc_units"],
+            "units": request_units,
             "language": config["api"]["twc_language"],
             "format": "json",
         },
@@ -550,8 +551,12 @@ def twc_daily_series(payload: dict[str, Any], event_date: str) -> tuple[list[str
     return daily_times, daily_temps
 
 
+def twc_forecast_unit_for_units(units: str) -> str:
+    return "F" if units == "e" else "C"
+
+
 def twc_forecast_unit(config: dict[str, Any]) -> str:
-    return "F" if config["api"]["twc_units"] == "e" else "C"
+    return twc_forecast_unit_for_units(config["api"]["twc_units"])
 
 
 def convert_temperature(value: Optional[float], from_unit: str, to_unit: str) -> Optional[float]:
@@ -602,19 +607,42 @@ def market_distance(forecast: float, market: TemperatureMarket, forecast_unit: s
     return outside, center, width
 
 
+def native_forecast_for_market(
+    forecasts_by_unit: dict[str, dict[str, Optional[float]]],
+    market: TemperatureMarket,
+    kind: str,
+) -> tuple[Optional[float], Optional[float], Optional[float], str]:
+    unit = (market.unit or "F").upper()
+    forecast = forecasts_by_unit.get(unit) or forecasts_by_unit.get("F") or forecasts_by_unit.get("C") or {}
+    high = forecast.get("high")
+    low = forecast.get("low")
+    temp = high if kind == "Highest" else low
+    return temp, high, low, unit
+
+
+def canonical_market_distance(
+    forecasts_by_unit: dict[str, dict[str, Optional[float]]],
+    market: TemperatureMarket,
+    kind: str,
+) -> tuple[float, float, float]:
+    native_temp, _, _, native_unit = native_forecast_for_market(forecasts_by_unit, market, kind)
+    if native_temp is None:
+        return 999.0, 999.0, 999.0
+    comparable_temp = convert_temperature(native_temp, native_unit, "F")
+    return market_distance(comparable_temp or native_temp, market, "F")
+
+
 def choose_most_likely_market(
     markets: list[TemperatureMarket],
-    forecast_temp: Optional[float],
-    forecast_unit: str,
+    forecasts_by_unit: dict[str, dict[str, Optional[float]]],
+    kind: str,
 ) -> Optional[TemperatureMarket]:
-    if forecast_temp is None:
-        return None
     usable = [
         m
         for m in markets
         if m.yes_price is not None and m.yes_price > 0 and (m.rule_min is not None or m.rule_max is not None)
     ]
-    return sorted(usable, key=lambda m: market_distance(forecast_temp, m, forecast_unit))[0] if usable else None
+    return sorted(usable, key=lambda m: canonical_market_distance(forecasts_by_unit, m, kind))[0] if usable else None
 
 
 def taker_fee_usdc(shares: float, price: float, fee_rate: float, fee_enabled: bool) -> float:
@@ -891,18 +919,33 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                 if not station:
                     raise RuntimeError("No ICAO station code found in Wunderground source URL.")
 
-                payload = twc_hourly_forecast_by_icao(config, station)
-                high, low, first_local, last_local = summarize_twc_daily_forecast(payload, event["_parsed_event_date"])
-                daily_times, daily_temps = twc_daily_series(payload, event["_parsed_event_date"])
-                forecast_temp = high if event["_parsed_kind"] == "Highest" else low
-                forecast_unit = twc_forecast_unit(config)
-                city_local_dt = first_twc_local_time(payload)
+                payload_f = twc_hourly_forecast_by_icao(config, station, units="e")
+                high_f, low_f, first_local, last_local = summarize_twc_daily_forecast(payload_f, event["_parsed_event_date"])
+                daily_times_f, daily_temps_f = twc_daily_series(payload_f, event["_parsed_event_date"])
+                payload_c = twc_hourly_forecast_by_icao(config, station, units="m")
+                high_c, low_c, _, _ = summarize_twc_daily_forecast(payload_c, event["_parsed_event_date"])
+                daily_times_c, daily_temps_c = twc_daily_series(payload_c, event["_parsed_event_date"])
+                forecasts_by_unit = {
+                    "F": {"high": high_f, "low": low_f},
+                    "C": {"high": high_c, "low": low_c},
+                }
+                forecast_temp = high_f if event["_parsed_kind"] == "Highest" else low_f
+                forecast_unit = "F"
+                city_local_dt = first_twc_local_time(payload_f)
                 window_allowed, window_text, window_reason = trading_window_status(
                     config,
                     event["_parsed_kind"],
                     city_local_dt,
                 )
-                chosen = choose_most_likely_market(markets, forecast_temp, forecast_unit) if window_allowed else None
+                chosen = choose_most_likely_market(markets, forecasts_by_unit, event["_parsed_kind"]) if window_allowed else None
+                if chosen:
+                    forecast_temp, forecast_high, forecast_low, forecast_unit = native_forecast_for_market(
+                        forecasts_by_unit,
+                        chosen,
+                        event["_parsed_kind"],
+                    )
+                else:
+                    forecast_high, forecast_low = high_f, low_f
                 comparable_min, comparable_max, comparable_unit = (
                     comparable_rule_bounds(chosen, forecast_unit) if chosen else (None, None, forecast_unit)
                 )
@@ -917,9 +960,13 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "kind": event["_parsed_kind"],
                         "station": station,
                         "forecast_temp": forecast_temp,
-                        "forecast_high": high,
-                        "forecast_low": low,
+                        "forecast_high": forecast_high,
+                        "forecast_low": forecast_low,
                         "forecast_unit": forecast_unit,
+                        "forecast_high_f": high_f,
+                        "forecast_low_f": low_f,
+                        "forecast_high_c": high_c,
+                        "forecast_low_c": low_c,
                         "city_local_time": city_local_dt.isoformat() if city_local_dt else "",
                         "trade_window": window_text,
                         "trade_window_allowed": window_allowed,
@@ -939,9 +986,12 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "trade_notional_usdc": config["trading"]["buy_notional_usdc"] if chosen else "",
                         "polymarket_url": event_url,
                         "wunderground_source_url": wu_source,
-                        "twc_valid_time_local_json": json.dumps(daily_times, ensure_ascii=False),
-                        "twc_temperature_json": json.dumps(daily_temps, ensure_ascii=False),
-                        "twc_raw_payload_json": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        "twc_valid_time_local_f_json": json.dumps(daily_times_f, ensure_ascii=False),
+                        "twc_temperature_f_json": json.dumps(daily_temps_f, ensure_ascii=False),
+                        "twc_raw_payload_f_json": json.dumps(payload_f, ensure_ascii=False, sort_keys=True),
+                        "twc_valid_time_local_c_json": json.dumps(daily_times_c, ensure_ascii=False),
+                        "twc_temperature_c_json": json.dumps(daily_temps_c, ensure_ascii=False),
+                        "twc_raw_payload_c_json": json.dumps(payload_c, ensure_ascii=False, sort_keys=True),
                         "error": "",
                     }
                 )
@@ -955,8 +1005,8 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                             wu_source,
                             station,
                             forecast_temp,
-                            high,
-                            low,
+                            forecast_high,
+                            forecast_low,
                             first_local,
                             last_local,
                         )
@@ -1007,6 +1057,10 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "forecast_high": "",
                         "forecast_low": "",
                         "forecast_unit": "",
+                        "forecast_high_f": "",
+                        "forecast_low_f": "",
+                        "forecast_high_c": "",
+                        "forecast_low_c": "",
                         "city_local_time": "",
                         "trade_window": "",
                         "trade_window_allowed": "",
@@ -1026,9 +1080,12 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "trade_notional_usdc": "",
                         "polymarket_url": event_url,
                         "wunderground_source_url": "",
-                        "twc_valid_time_local_json": "",
-                        "twc_temperature_json": "",
-                        "twc_raw_payload_json": "",
+                        "twc_valid_time_local_f_json": "",
+                        "twc_temperature_f_json": "",
+                        "twc_raw_payload_f_json": "",
+                        "twc_valid_time_local_c_json": "",
+                        "twc_temperature_c_json": "",
+                        "twc_raw_payload_c_json": "",
                         "error": repr(exc),
                     }
                 )
