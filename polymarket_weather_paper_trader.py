@@ -199,6 +199,8 @@ def log_info(message: str) -> None:
 def redacted_config(config: dict[str, Any]) -> dict[str, Any]:
     def redact(value: Any, key: str = "") -> Any:
         key_lower = key.lower()
+        if key_lower.endswith("_env"):
+            return value
         if any(secret_word in key_lower for secret_word in ("key", "token", "secret", "password")):
             return "***REDACTED***" if value else ""
         if isinstance(value, dict):
@@ -651,26 +653,31 @@ def pct(numerator: float, denominator: float) -> float:
 
 def performance_row(group_name: str, group_value: str, rows: list[PaperTrade]) -> dict[str, Any]:
     settled = [t for t in rows if t.status == "SETTLED"]
+    open_rows = [t for t in rows if t.status != "SETTLED"]
     total_notional = sum(t.notional_usdc for t in rows)
     total_fees = sum(t.buy_fee_usdc for t in rows)
     total_cost = sum(t.total_cost_usdc for t in rows)
+    settled_cost = sum(t.total_cost_usdc for t in settled)
+    open_cost = sum(t.total_cost_usdc for t in open_rows)
     total_payout = sum(t.payout_usdc for t in settled)
     wins = [t for t in settled if t.pnl_usdc > 0]
     losses = [t for t in settled if t.pnl_usdc < 0]
-    pnl = total_payout - total_cost
+    realized_pnl = total_payout - settled_cost
     return {
         group_name: group_value,
         "trade_count": len(rows),
         "settled_count": len(settled),
         "win_count": len(wins),
         "loss_count": len(losses),
-        "open_count": len(rows) - len(settled),
+        "open_count": len(open_rows),
         "total_notional_usdc": round(total_notional, 8),
         "total_fees_usdc": round(total_fees, 8),
         "total_cost_usdc": round(total_cost, 8),
+        "settled_cost_usdc": round(settled_cost, 8),
+        "open_cost_usdc": round(open_cost, 8),
         "total_payout_usdc": round(total_payout, 8),
-        "total_pnl_usdc": round(pnl, 8),
-        "roi_on_total_cost": pct(pnl, total_cost),
+        "realized_pnl_usdc": round(realized_pnl, 8),
+        "realized_roi_on_settled_cost": pct(realized_pnl, settled_cost),
         "win_rate_settled": pct(len(wins), len(settled)),
     }
 
@@ -915,12 +922,17 @@ def summarize_settled(config: dict[str, Any]) -> None:
     if not trades:
         return
     settled = [t for t in trades if t.status == "SETTLED"]
-    total_cost = sum(t.total_cost_usdc for t in trades)
+    open_trades = [t for t in trades if t.status != "SETTLED"]
+    settled_cost = sum(t.total_cost_usdc for t in settled)
+    open_cost = sum(t.total_cost_usdc for t in open_trades)
+    total_cost = settled_cost + open_cost
     total_payout = sum(t.payout_usdc for t in settled)
     total_fee = sum(t.buy_fee_usdc for t in trades)
+    realized_pnl = total_payout - settled_cost
     log_info(
-        f"trades={len(trades)} settled={len(settled)} total_cost=${total_cost:.2f} "
-        f"fees=${total_fee:.2f} payout=${total_payout:.2f} pnl=${total_payout - total_cost:.2f}"
+        f"trades={len(trades)} settled={len(settled)} open={len(open_trades)} "
+        f"total_cost=${total_cost:.2f} open_cost=${open_cost:.2f} fees=${total_fee:.2f} "
+        f"settled_payout=${total_payout:.2f} realized_pnl=${realized_pnl:.2f}"
     )
 
 
