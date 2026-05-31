@@ -123,6 +123,7 @@ def default_config() -> dict[str, Any]:
             "polymarket_gamma_base": "https://gamma-api.polymarket.com",
             "weather_company_base": "https://api.weather.com",
             "twc_api_key_env": "TWC_API_KEY",
+            "twc_api_key": "",
             "twc_duration": "2day",
             "twc_units": "e",
             "twc_language": "en-US",
@@ -158,6 +159,7 @@ def default_config() -> dict[str, Any]:
             "state_json": "polymarket_weather_state.json",
             "log_file": "bot.log",
             "log_level": "INFO",
+            "console_log_enabled": False,
         },
     }
 
@@ -183,14 +185,29 @@ def setup_logging(config: dict[str, Any]) -> None:
     file_handler.setFormatter(formatter)
     LOGGER.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter("%(message)s"))
-    LOGGER.addHandler(console_handler)
+    if config["outputs"].get("console_log_enabled", False):
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(logging.Formatter("%(message)s"))
+        LOGGER.addHandler(console_handler)
 
 
 def log_info(message: str) -> None:
     LOGGER.info(message)
+
+
+def redacted_config(config: dict[str, Any]) -> dict[str, Any]:
+    def redact(value: Any, key: str = "") -> Any:
+        key_lower = key.lower()
+        if any(secret_word in key_lower for secret_word in ("key", "token", "secret", "password")):
+            return "***REDACTED***" if value else ""
+        if isinstance(value, dict):
+            return {k: redact(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [redact(v, key) for v in value]
+        return value
+
+    return redact(config)
 
 
 def resolve_date(value: str) -> date:
@@ -228,9 +245,12 @@ def gamma_get(config: dict[str, Any], path: str, params: Optional[dict[str, Any]
 
 
 def twc_get(config: dict[str, Any], path: str, params: dict[str, Any]) -> Any:
-    api_key = os.environ.get(config["api"]["twc_api_key_env"], "").strip()
+    env_name = str(config["api"].get("twc_api_key_env", "TWC_API_KEY")).strip()
+    api_key = os.environ.get(env_name, "").strip() if env_name else ""
     if not api_key:
-        raise RuntimeError(f"Missing {config['api']['twc_api_key_env']} environment variable.")
+        api_key = str(config["api"].get("twc_api_key", "")).strip()
+    if not api_key:
+        raise RuntimeError(f"Missing Weather Company API key. Set environment variable {env_name!r} or config api.twc_api_key.")
     timeout = int(config["api"]["request_timeout_seconds"])
     query = {"apiKey": api_key, **params}
     return http_get_json(f"{config['api']['weather_company_base']}{path}", query, timeout)
@@ -907,7 +927,7 @@ def summarize_settled(config: dict[str, Any]) -> None:
 def run(config: dict[str, Any]) -> None:
     cycle_num = 0
     max_cycles = int(config["scheduler"]["max_cycles"])
-    LOGGER.info("bot started config=%s", json.dumps(config, ensure_ascii=False, sort_keys=True))
+    LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
     while True:
         cycle_num += 1
         run_cycle(config, cycle_num)

@@ -3,6 +3,7 @@
     "polymarket_gamma_base": "https://gamma-api.polymarket.com",
     "weather_company_base": "https://api.weather.com",
     "twc_api_key_env": "TWC_API_KEY",
+    "twc_api_key": "",
     "twc_duration": "2day",
     "twc_units": "e",
     "twc_language": "en-US",
@@ -37,6 +38,7 @@
     "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
     "state_json": "polymarket_weather_state.json",
     "log_file": "bot.log",
-    "log_level": "INFO"
+    "log_level": "INFO",
+    "console_log_enabled": false
   }
 }
