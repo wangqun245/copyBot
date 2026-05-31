@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Optional
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -134,10 +135,61 @@ def default_config() -> dict[str, Any]:
             "per_request_delay_seconds": 0.25,
         },
         "events": {
-            "target_dates": ["tomorrow"],
+            "target_dates": ["today"],
             "city_filter": "",
             "include_closed": False,
             "max_offsets": 1200,
+            "city_timezones": {
+                "London": "Europe/London",
+                "Paris": "Europe/Paris",
+                "Sao Paulo": "America/Sao_Paulo",
+                "Buenos Aires": "America/Argentina/Buenos_Aires",
+                "Seoul": "Asia/Seoul",
+                "Toronto": "America/Toronto",
+                "Seattle": "America/Los_Angeles",
+                "NYC": "America/New_York",
+                "Dallas": "America/Chicago",
+                "Atlanta": "America/New_York",
+                "Miami": "America/New_York",
+                "Chicago": "America/Chicago",
+                "Ankara": "Europe/Istanbul",
+                "Wellington": "Pacific/Auckland",
+                "Lucknow": "Asia/Kolkata",
+                "Munich": "Europe/Berlin",
+                "Tel Aviv": "Asia/Jerusalem",
+                "Tokyo": "Asia/Tokyo",
+                "Hong Kong": "Asia/Hong_Kong",
+                "Shanghai": "Asia/Shanghai",
+                "Singapore": "Asia/Singapore",
+                "Milan": "Europe/Rome",
+                "Madrid": "Europe/Madrid",
+                "Warsaw": "Europe/Warsaw",
+                "Taipei": "Asia/Taipei",
+                "Chongqing": "Asia/Shanghai",
+                "Beijing": "Asia/Shanghai",
+                "Wuhan": "Asia/Shanghai",
+                "Chengdu": "Asia/Shanghai",
+                "Shenzhen": "Asia/Shanghai",
+                "Austin": "America/Chicago",
+                "Denver": "America/Denver",
+                "Houston": "America/Chicago",
+                "Los Angeles": "America/Los_Angeles",
+                "San Francisco": "America/Los_Angeles",
+                "Moscow": "Europe/Moscow",
+                "Istanbul": "Europe/Istanbul",
+                "Mexico City": "America/Mexico_City",
+                "Busan": "Asia/Seoul",
+                "Amsterdam": "Europe/Amsterdam",
+                "Helsinki": "Europe/Helsinki",
+                "Panama City": "America/Panama",
+                "Kuala Lumpur": "Asia/Kuala_Lumpur",
+                "Jeddah": "Asia/Riyadh",
+                "Cape Town": "Africa/Johannesburg",
+                "Guangzhou": "Asia/Shanghai",
+                "Qingdao": "Asia/Shanghai",
+                "Karachi": "Asia/Karachi",
+                "Manila": "Asia/Manila",
+            },
         },
         "trading": {
             "strategy_name": "twc_every_15m_most_likely",
@@ -146,8 +198,10 @@ def default_config() -> dict[str, Any]:
             "fee_enabled": True,
             "one_trade_per_event_per_cycle": True,
             "time_windows_enabled": True,
-            "lowest_local_hour_window": "0-8",
+            "lowest_local_hour_window": "0-6",
             "highest_local_hour_window": "12-18",
+            "forecast_horizon_hours": 6,
+            "include_observed_today": True,
         },
         "scheduler": {
             "poll_interval_minutes": 15,
@@ -502,6 +556,31 @@ def trading_window_status(config: dict[str, Any], kind: str, local_dt: Optional[
     return allowed, window_text, reason
 
 
+def city_local_now(config: dict[str, Any], city: str) -> tuple[Optional[datetime], str, str]:
+    timezone_name = (config["events"].get("city_timezones") or {}).get(city, "")
+    if not timezone_name:
+        return None, "", "missing_city_timezone"
+    try:
+        return datetime.now(ZoneInfo(timezone_name)), timezone_name, "city_timezone"
+    except ZoneInfoNotFoundError:
+        return None, timezone_name, "invalid_city_timezone"
+
+
+def event_market_unit(markets: list[TemperatureMarket]) -> str:
+    counts: dict[str, int] = {}
+    for market in markets:
+        unit = (market.unit or "").upper()
+        if unit in {"F", "C"} and (market.rule_min is not None or market.rule_max is not None):
+            counts[unit] = counts.get(unit, 0) + 1
+    if not counts:
+        return "F"
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def twc_units_for_temperature_unit(unit: str) -> str:
+    return "m" if unit.upper() == "C" else "e"
+
+
 def twc_hourly_forecast_by_icao(config: dict[str, Any], icao_code: str, units: Optional[str] = None) -> dict[str, Any]:
     request_units = units or config["api"]["twc_units"]
     return twc_get(
@@ -510,6 +589,19 @@ def twc_hourly_forecast_by_icao(config: dict[str, Any], icao_code: str, units: O
         {
             "icaoCode": icao_code,
             "units": request_units,
+            "language": config["api"]["twc_language"],
+            "format": "json",
+        },
+    )
+
+
+def twc_historical_hourly_by_icao(config: dict[str, Any], icao_code: str, units: str) -> dict[str, Any]:
+    return twc_get(
+        config,
+        "/v3/wx/conditions/historical/hourly/1day",
+        {
+            "icaoCode": icao_code,
+            "units": units,
             "language": config["api"]["twc_language"],
             "format": "json",
         },
@@ -534,6 +626,82 @@ def summarize_twc_daily_forecast(payload: dict[str, Any], event_date: str) -> tu
         matched[0][0].isoformat(),
         matched[-1][0].isoformat(),
     )
+
+
+def filtered_twc_points(
+    payload: dict[str, Any],
+    event_date: str,
+    horizon_hours: int,
+) -> list[tuple[datetime, float]]:
+    temps = payload.get("temperature") or []
+    times = payload.get("validTimeLocal") or []
+    current_local = first_twc_local_time(payload)
+    if current_local is None:
+        return []
+    horizon_end = current_local + timedelta(hours=horizon_hours)
+    matched: list[tuple[datetime, float]] = []
+    for idx, raw_time in enumerate(times):
+        if idx >= len(temps) or temps[idx] is None:
+            continue
+        local_dt = parse_twc_local_time(str(raw_time))
+        if not local_dt:
+            continue
+        if local_dt.date().isoformat() != event_date:
+            continue
+        if current_local <= local_dt <= horizon_end:
+            matched.append((local_dt, float(temps[idx])))
+    return matched
+
+
+def observed_twc_points(payload: dict[str, Any], event_date: str, current_local: Optional[datetime]) -> list[tuple[datetime, float]]:
+    temps = payload.get("temperature") or []
+    times = payload.get("validTimeLocal") or []
+    matched: list[tuple[datetime, float]] = []
+    for idx, raw_time in enumerate(times):
+        if idx >= len(temps) or temps[idx] is None:
+            continue
+        local_dt = parse_twc_local_time(str(raw_time))
+        if not local_dt:
+            continue
+        if local_dt.date().isoformat() != event_date:
+            continue
+        if current_local is None or local_dt <= current_local:
+            matched.append((local_dt, float(temps[idx])))
+    return sorted(matched, key=lambda item: item[0])
+
+
+def summarize_points(points: list[tuple[datetime, float]]) -> tuple[Optional[float], Optional[float], str, str, list[str], list[Any]]:
+    if not points:
+        return None, None, "", "", [], []
+    ordered = sorted(points, key=lambda item: item[0])
+    return (
+        max(temp for _, temp in ordered),
+        min(temp for _, temp in ordered),
+        ordered[0][0].isoformat(),
+        ordered[-1][0].isoformat(),
+        [dt.isoformat() for dt, _ in ordered],
+        [temp for _, temp in ordered],
+    )
+
+
+def merge_observed_and_forecast_points(
+    observed: list[tuple[datetime, float]],
+    forecast: list[tuple[datetime, float]],
+) -> list[tuple[datetime, float]]:
+    by_time: dict[str, tuple[datetime, float]] = {}
+    for item in observed:
+        by_time[item[0].isoformat()] = item
+    for item in forecast:
+        by_time.setdefault(item[0].isoformat(), item)
+    return sorted(by_time.values(), key=lambda item: item[0])
+
+
+def summarize_twc_horizon_forecast(
+    payload: dict[str, Any],
+    event_date: str,
+    horizon_hours: int,
+) -> tuple[Optional[float], Optional[float], str, str, list[str], list[Any]]:
+    return summarize_points(filtered_twc_points(payload, event_date, horizon_hours))
 
 
 def twc_daily_series(payload: dict[str, Any], event_date: str) -> tuple[list[str], list[Any]]:
@@ -613,7 +781,7 @@ def native_forecast_for_market(
     kind: str,
 ) -> tuple[Optional[float], Optional[float], Optional[float], str]:
     unit = (market.unit or "F").upper()
-    forecast = forecasts_by_unit.get(unit) or forecasts_by_unit.get("F") or forecasts_by_unit.get("C") or {}
+    forecast = forecasts_by_unit.get(unit) or {}
     high = forecast.get("high")
     low = forecast.get("low")
     temp = high if kind == "Highest" else low
@@ -640,7 +808,10 @@ def choose_most_likely_market(
     usable = [
         m
         for m in markets
-        if m.yes_price is not None and m.yes_price > 0 and (m.rule_min is not None or m.rule_max is not None)
+        if m.yes_price is not None
+        and m.yes_price > 0
+        and (m.rule_min is not None or m.rule_max is not None)
+        and native_forecast_for_market(forecasts_by_unit, m, kind)[0] is not None
     ]
     return sorted(usable, key=lambda m: canonical_market_distance(forecasts_by_unit, m, kind))[0] if usable else None
 
@@ -664,7 +835,7 @@ def build_trade(
     last_valid_time_local: str,
 ) -> PaperTrade:
     now = datetime.now().isoformat(timespec="seconds")
-    forecast_unit = twc_forecast_unit(config)
+    forecast_unit = (market.unit or twc_forecast_unit(config)).upper()
     comparable_min, comparable_max, comparable_unit = comparable_rule_bounds(market, forecast_unit)
     notional = float(config["trading"]["buy_notional_usdc"])
     price = float(market.yes_price or 0.0)
@@ -914,30 +1085,128 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
             markets = markets_for_event(config, event)
             event_url = poly_url_from_event(event)
             try:
-                wu_source = extract_wunderground_source(config, event_url)
-                station = station_from_wu_url(wu_source)
-                if not station:
-                    raise RuntimeError("No ICAO station code found in Wunderground source URL.")
-
-                payload_f = twc_hourly_forecast_by_icao(config, station, units="e")
-                high_f, low_f, first_local, last_local = summarize_twc_daily_forecast(payload_f, event["_parsed_event_date"])
-                daily_times_f, daily_temps_f = twc_daily_series(payload_f, event["_parsed_event_date"])
-                payload_c = twc_hourly_forecast_by_icao(config, station, units="m")
-                high_c, low_c, _, _ = summarize_twc_daily_forecast(payload_c, event["_parsed_event_date"])
-                daily_times_c, daily_temps_c = twc_daily_series(payload_c, event["_parsed_event_date"])
-                forecasts_by_unit = {
-                    "F": {"high": high_f, "low": low_f},
-                    "C": {"high": high_c, "low": low_c},
-                }
-                forecast_temp = high_f if event["_parsed_kind"] == "Highest" else low_f
-                forecast_unit = "F"
-                city_local_dt = first_twc_local_time(payload_f)
+                event_unit = event_market_unit(markets)
+                twc_units = twc_units_for_temperature_unit(event_unit)
+                city_local_dt, city_timezone, city_time_source = city_local_now(config, event["_parsed_city"])
                 window_allowed, window_text, window_reason = trading_window_status(
                     config,
                     event["_parsed_kind"],
                     city_local_dt,
                 )
-                chosen = choose_most_likely_market(markets, forecasts_by_unit, event["_parsed_kind"]) if window_allowed else None
+                observed_at = datetime.now().isoformat(timespec="seconds")
+                if not window_allowed:
+                    snapshot_rows.append(
+                        {
+                            "cycle_id": cycle_id,
+                            "observed_at": observed_at,
+                            "target_date": target.isoformat(),
+                            "city": event["_parsed_city"],
+                            "kind": event["_parsed_kind"],
+                            "station": "",
+                            "event_market_unit": event_unit,
+                            "twc_units_requested": "",
+                            "forecast_temp": "",
+                            "forecast_high": "",
+                            "forecast_low": "",
+                            "forecast_unit": event_unit,
+                            "forecast_high_f": "",
+                            "forecast_low_f": "",
+                            "forecast_high_c": "",
+                            "forecast_low_c": "",
+                            "forecast_horizon_hours": "",
+                            "include_observed_today": config["trading"].get("include_observed_today", True),
+                            "observed_point_count_f": "",
+                            "forecast_point_count_f": "",
+                            "combined_point_count_f": "",
+                            "observed_point_count_c": "",
+                            "forecast_point_count_c": "",
+                            "combined_point_count_c": "",
+                            "city_local_time": city_local_dt.isoformat() if city_local_dt else "",
+                            "city_timezone": city_timezone,
+                            "city_time_source": city_time_source,
+                            "trade_window": window_text,
+                            "trade_window_allowed": False,
+                            "trade_window_reason": window_reason,
+                            "first_valid_time_local": "",
+                            "last_valid_time_local": "",
+                            "chosen_market_id": "",
+                            "chosen_condition_id": "",
+                            "chosen_question": "",
+                            "chosen_yes_price": "",
+                            "chosen_rule_min": "",
+                            "chosen_rule_max": "",
+                            "chosen_market_unit": "",
+                            "chosen_comparable_rule_min": "",
+                            "chosen_comparable_rule_max": "",
+                            "chosen_comparable_unit": "",
+                            "trade_notional_usdc": "",
+                            "polymarket_url": event_url,
+                            "wunderground_source_url": "",
+                            "twc_valid_time_local_f_json": "",
+                            "twc_temperature_f_json": "",
+                            "twc_raw_payload_f_json": "",
+                            "twc_observed_time_local_f_json": "",
+                            "twc_observed_temperature_f_json": "",
+                            "twc_raw_historical_payload_f_json": "",
+                            "twc_valid_time_local_c_json": "",
+                            "twc_temperature_c_json": "",
+                            "twc_raw_payload_c_json": "",
+                            "twc_observed_time_local_c_json": "",
+                            "twc_observed_temperature_c_json": "",
+                            "twc_raw_historical_payload_c_json": "",
+                            "error": "",
+                        }
+                    )
+                    LOGGER.info(
+                        "[%s] skip city=%s kind=%s reason=%s local_time=%s timezone=%s",
+                        cycle_id,
+                        event["_parsed_city"],
+                        event["_parsed_kind"],
+                        window_reason,
+                        city_local_dt.isoformat() if city_local_dt else "",
+                        city_timezone,
+                    )
+                    continue
+
+                wu_source = extract_wunderground_source(config, event_url)
+                station = station_from_wu_url(wu_source)
+                if not station:
+                    raise RuntimeError("No ICAO station code found in Wunderground source URL.")
+
+                horizon_hours = int(config["trading"]["forecast_horizon_hours"])
+                payload = twc_hourly_forecast_by_icao(config, station, units=twc_units)
+                forecast_points = filtered_twc_points(payload, event["_parsed_event_date"], horizon_hours)
+                observed_points: list[tuple[datetime, float]] = []
+                historical_payload: dict[str, Any] = {}
+                if config["trading"].get("include_observed_today", True):
+                    historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
+                    observed_points = observed_twc_points(historical_payload, event["_parsed_event_date"], city_local_dt)
+                combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
+                high, low, first_local, last_local, daily_times, daily_temps = summarize_points(combined_points)
+                high_f = high if event_unit == "F" else ""
+                low_f = low if event_unit == "F" else ""
+                high_c = high if event_unit == "C" else ""
+                low_c = low if event_unit == "C" else ""
+                daily_times_f = daily_times if event_unit == "F" else []
+                daily_temps_f = daily_temps if event_unit == "F" else []
+                daily_times_c = daily_times if event_unit == "C" else []
+                daily_temps_c = daily_temps if event_unit == "C" else []
+                observed_points_f = observed_points if event_unit == "F" else []
+                observed_points_c = observed_points if event_unit == "C" else []
+                forecast_points_f = forecast_points if event_unit == "F" else []
+                forecast_points_c = forecast_points if event_unit == "C" else []
+                combined_points_f = combined_points if event_unit == "F" else []
+                combined_points_c = combined_points if event_unit == "C" else []
+                historical_payload_f = historical_payload if event_unit == "F" else {}
+                historical_payload_c = historical_payload if event_unit == "C" else {}
+                payload_f = payload if event_unit == "F" else {}
+                payload_c = payload if event_unit == "C" else {}
+                forecasts_by_unit = {
+                    event_unit: {"high": high, "low": low},
+                }
+                forecast_temp = high if event["_parsed_kind"] == "Highest" else low
+                forecast_unit = event_unit
+                chosen = choose_most_likely_market(markets, forecasts_by_unit, event["_parsed_kind"])
                 if chosen:
                     forecast_temp, forecast_high, forecast_low, forecast_unit = native_forecast_for_market(
                         forecasts_by_unit,
@@ -959,6 +1228,8 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "city": event["_parsed_city"],
                         "kind": event["_parsed_kind"],
                         "station": station,
+                        "event_market_unit": event_unit,
+                        "twc_units_requested": twc_units,
                         "forecast_temp": forecast_temp,
                         "forecast_high": forecast_high,
                         "forecast_low": forecast_low,
@@ -967,7 +1238,17 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "forecast_low_f": low_f,
                         "forecast_high_c": high_c,
                         "forecast_low_c": low_c,
+                        "forecast_horizon_hours": horizon_hours,
+                        "include_observed_today": config["trading"].get("include_observed_today", True),
+                        "observed_point_count_f": len(observed_points_f),
+                        "forecast_point_count_f": len(forecast_points_f),
+                        "combined_point_count_f": len(combined_points_f),
+                        "observed_point_count_c": len(observed_points_c),
+                        "forecast_point_count_c": len(forecast_points_c),
+                        "combined_point_count_c": len(combined_points_c),
                         "city_local_time": city_local_dt.isoformat() if city_local_dt else "",
+                        "city_timezone": city_timezone,
+                        "city_time_source": city_time_source,
                         "trade_window": window_text,
                         "trade_window_allowed": window_allowed,
                         "trade_window_reason": window_reason,
@@ -989,9 +1270,15 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "twc_valid_time_local_f_json": json.dumps(daily_times_f, ensure_ascii=False),
                         "twc_temperature_f_json": json.dumps(daily_temps_f, ensure_ascii=False),
                         "twc_raw_payload_f_json": json.dumps(payload_f, ensure_ascii=False, sort_keys=True),
+                        "twc_observed_time_local_f_json": json.dumps([dt.isoformat() for dt, _ in observed_points_f], ensure_ascii=False),
+                        "twc_observed_temperature_f_json": json.dumps([temp for _, temp in observed_points_f], ensure_ascii=False),
+                        "twc_raw_historical_payload_f_json": json.dumps(historical_payload_f, ensure_ascii=False, sort_keys=True),
                         "twc_valid_time_local_c_json": json.dumps(daily_times_c, ensure_ascii=False),
                         "twc_temperature_c_json": json.dumps(daily_temps_c, ensure_ascii=False),
                         "twc_raw_payload_c_json": json.dumps(payload_c, ensure_ascii=False, sort_keys=True),
+                        "twc_observed_time_local_c_json": json.dumps([dt.isoformat() for dt, _ in observed_points_c], ensure_ascii=False),
+                        "twc_observed_temperature_c_json": json.dumps([temp for _, temp in observed_points_c], ensure_ascii=False),
+                        "twc_raw_historical_payload_c_json": json.dumps(historical_payload_c, ensure_ascii=False, sort_keys=True),
                         "error": "",
                     }
                 )
@@ -1053,6 +1340,8 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "city": event.get("_parsed_city", ""),
                         "kind": event.get("_parsed_kind", ""),
                         "station": "",
+                        "event_market_unit": "",
+                        "twc_units_requested": "",
                         "forecast_temp": "",
                         "forecast_high": "",
                         "forecast_low": "",
@@ -1061,7 +1350,17 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "forecast_low_f": "",
                         "forecast_high_c": "",
                         "forecast_low_c": "",
+                        "forecast_horizon_hours": "",
+                        "include_observed_today": "",
+                        "observed_point_count_f": "",
+                        "forecast_point_count_f": "",
+                        "combined_point_count_f": "",
+                        "observed_point_count_c": "",
+                        "forecast_point_count_c": "",
+                        "combined_point_count_c": "",
                         "city_local_time": "",
+                        "city_timezone": "",
+                        "city_time_source": "",
                         "trade_window": "",
                         "trade_window_allowed": "",
                         "trade_window_reason": "event_error",
@@ -1083,9 +1382,15 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "twc_valid_time_local_f_json": "",
                         "twc_temperature_f_json": "",
                         "twc_raw_payload_f_json": "",
+                        "twc_observed_time_local_f_json": "",
+                        "twc_observed_temperature_f_json": "",
+                        "twc_raw_historical_payload_f_json": "",
                         "twc_valid_time_local_c_json": "",
                         "twc_temperature_c_json": "",
                         "twc_raw_payload_c_json": "",
+                        "twc_observed_time_local_c_json": "",
+                        "twc_observed_temperature_c_json": "",
+                        "twc_raw_historical_payload_c_json": "",
                         "error": repr(exc),
                     }
                 )
