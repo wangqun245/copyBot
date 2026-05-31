@@ -93,6 +93,9 @@ class PaperTrade:
     rule_min: Optional[float]
     rule_max: Optional[float]
     market_unit: str
+    comparable_rule_min: Optional[float]
+    comparable_rule_max: Optional[float]
+    comparable_unit: str
     yes_price: Optional[float]
     notional_usdc: float
     shares: float
@@ -358,11 +361,21 @@ def station_from_wu_url(url: str) -> str:
     return station if re.fullmatch(r"[A-Z0-9]{4}", station) else ""
 
 
+def infer_temperature_unit(text: str, default_unit: str = "F") -> str:
+    normalized = text.lower()
+    if "celsius" in normalized or "centigrade" in normalized or "°c" in normalized or "℃" in normalized:
+        return "C"
+    if "fahrenheit" in normalized or "°f" in normalized or "℉" in normalized:
+        return "F"
+    return default_unit.upper()
+
+
 def parse_temperature_rule(text: str, default_unit: str = "F") -> tuple[Optional[float], Optional[float], str]:
     normalized = text.replace("\u2013", "-").replace("\u2014", "-")
     low_text = normalized.lower()
-    nums = [(float(n), (u or default_unit).upper()) for n, u in TEMP_NUMBER_RE.findall(normalized)]
-    unit = nums[0][1] if nums else default_unit
+    inferred_unit = infer_temperature_unit(normalized, default_unit)
+    nums = [(float(n), (u or inferred_unit).upper()) for n, u in TEMP_NUMBER_RE.findall(normalized)]
+    unit = nums[0][1] if nums else inferred_unit
     values = [n for n, _ in nums]
     if not values:
         return None, None, unit
@@ -407,7 +420,12 @@ def markets_for_event(config: dict[str, Any], event: dict[str, Any]) -> list[Tem
     parsed: list[TemperatureMarket] = []
     for market in markets:
         question = market.get("question") or market.get("title") or title
-        rule_min, rule_max, unit = parse_temperature_rule(question)
+        unit_context = " ".join(
+            str(market.get(field) or "")
+            for field in ("question", "title", "description", "resolutionSource", "rules")
+        )
+        market_unit = infer_temperature_unit(unit_context or question)
+        rule_min, rule_max, unit = parse_temperature_rule(question, default_unit=market_unit)
         yes_price = outcome_price(market, "Yes")
         parsed.append(
             TemperatureMarket(
@@ -532,8 +550,36 @@ def twc_daily_series(payload: dict[str, Any], event_date: str) -> tuple[list[str
     return daily_times, daily_temps
 
 
-def market_distance(forecast: float, market: TemperatureMarket) -> tuple[float, float, float]:
-    lo, hi = market.rule_min, market.rule_max
+def twc_forecast_unit(config: dict[str, Any]) -> str:
+    return "F" if config["api"]["twc_units"] == "e" else "C"
+
+
+def convert_temperature(value: Optional[float], from_unit: str, to_unit: str) -> Optional[float]:
+    if value is None:
+        return None
+    source = (from_unit or to_unit).upper()
+    target = (to_unit or source).upper()
+    if source == target:
+        return value
+    if source == "C" and target == "F":
+        return value * 9.0 / 5.0 + 32.0
+    if source == "F" and target == "C":
+        return (value - 32.0) * 5.0 / 9.0
+    return value
+
+
+def comparable_rule_bounds(market: TemperatureMarket, target_unit: str) -> tuple[Optional[float], Optional[float], str]:
+    market_unit = (market.unit or target_unit).upper()
+    comparable_unit = target_unit.upper()
+    return (
+        convert_temperature(market.rule_min, market_unit, comparable_unit),
+        convert_temperature(market.rule_max, market_unit, comparable_unit),
+        comparable_unit,
+    )
+
+
+def market_distance(forecast: float, market: TemperatureMarket, forecast_unit: str) -> tuple[float, float, float]:
+    lo, hi, _ = comparable_rule_bounds(market, forecast_unit)
     if lo is not None and forecast < lo:
         outside = lo - forecast
     elif hi is not None and forecast > hi:
@@ -556,7 +602,11 @@ def market_distance(forecast: float, market: TemperatureMarket) -> tuple[float, 
     return outside, center, width
 
 
-def choose_most_likely_market(markets: list[TemperatureMarket], forecast_temp: Optional[float]) -> Optional[TemperatureMarket]:
+def choose_most_likely_market(
+    markets: list[TemperatureMarket],
+    forecast_temp: Optional[float],
+    forecast_unit: str,
+) -> Optional[TemperatureMarket]:
     if forecast_temp is None:
         return None
     usable = [
@@ -564,7 +614,7 @@ def choose_most_likely_market(markets: list[TemperatureMarket], forecast_temp: O
         for m in markets
         if m.yes_price is not None and m.yes_price > 0 and (m.rule_min is not None or m.rule_max is not None)
     ]
-    return sorted(usable, key=lambda m: market_distance(forecast_temp, m))[0] if usable else None
+    return sorted(usable, key=lambda m: market_distance(forecast_temp, m, forecast_unit))[0] if usable else None
 
 
 def taker_fee_usdc(shares: float, price: float, fee_rate: float, fee_enabled: bool) -> float:
@@ -586,6 +636,8 @@ def build_trade(
     last_valid_time_local: str,
 ) -> PaperTrade:
     now = datetime.now().isoformat(timespec="seconds")
+    forecast_unit = twc_forecast_unit(config)
+    comparable_min, comparable_max, comparable_unit = comparable_rule_bounds(market, forecast_unit)
     notional = float(config["trading"]["buy_notional_usdc"])
     price = float(market.yes_price or 0.0)
     shares = notional / price if price > 0 else 0.0
@@ -619,10 +671,13 @@ def build_trade(
         forecast_low=forecast_low,
         forecast_first_valid_time_local=first_valid_time_local,
         forecast_last_valid_time_local=last_valid_time_local,
-        forecast_unit="F" if config["api"]["twc_units"] == "e" else "C",
+        forecast_unit=forecast_unit,
         rule_min=market.rule_min,
         rule_max=market.rule_max,
         market_unit=market.unit,
+        comparable_rule_min=comparable_min,
+        comparable_rule_max=comparable_max,
+        comparable_unit=comparable_unit,
         yes_price=market.yes_price,
         notional_usdc=round(notional, 6),
         shares=round(shares, 8),
@@ -663,6 +718,8 @@ def read_trades(path: str) -> list[PaperTrade]:
                 "forecast_low",
                 "rule_min",
                 "rule_max",
+                "comparable_rule_min",
+                "comparable_rule_max",
                 "yes_price",
                 "notional_usdc",
                 "shares",
@@ -677,6 +734,9 @@ def read_trades(path: str) -> list[PaperTrade]:
                 cleaned[field] = value
         cleaned.setdefault("forecast_first_valid_time_local", "")
         cleaned.setdefault("forecast_last_valid_time_local", "")
+        cleaned.setdefault("comparable_rule_min", None)
+        cleaned.setdefault("comparable_rule_max", None)
+        cleaned.setdefault("comparable_unit", cleaned.get("forecast_unit", ""))
         for field in {"notional_usdc", "shares", "taker_fee_rate", "buy_fee_usdc", "total_cost_usdc", "payout_usdc", "pnl_usdc"}:
             cleaned[field] = float(cleaned[field] or 0.0)
         trades.append(PaperTrade(**cleaned))
@@ -835,13 +895,17 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                 high, low, first_local, last_local = summarize_twc_daily_forecast(payload, event["_parsed_event_date"])
                 daily_times, daily_temps = twc_daily_series(payload, event["_parsed_event_date"])
                 forecast_temp = high if event["_parsed_kind"] == "Highest" else low
+                forecast_unit = twc_forecast_unit(config)
                 city_local_dt = first_twc_local_time(payload)
                 window_allowed, window_text, window_reason = trading_window_status(
                     config,
                     event["_parsed_kind"],
                     city_local_dt,
                 )
-                chosen = choose_most_likely_market(markets, forecast_temp) if window_allowed else None
+                chosen = choose_most_likely_market(markets, forecast_temp, forecast_unit) if window_allowed else None
+                comparable_min, comparable_max, comparable_unit = (
+                    comparable_rule_bounds(chosen, forecast_unit) if chosen else (None, None, forecast_unit)
+                )
                 observed_at = datetime.now().isoformat(timespec="seconds")
 
                 snapshot_rows.append(
@@ -855,7 +919,7 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "forecast_temp": forecast_temp,
                         "forecast_high": high,
                         "forecast_low": low,
-                        "forecast_unit": "F" if config["api"]["twc_units"] == "e" else "C",
+                        "forecast_unit": forecast_unit,
                         "city_local_time": city_local_dt.isoformat() if city_local_dt else "",
                         "trade_window": window_text,
                         "trade_window_allowed": window_allowed,
@@ -868,6 +932,10 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "chosen_yes_price": chosen.yes_price if chosen else "",
                         "chosen_rule_min": chosen.rule_min if chosen else "",
                         "chosen_rule_max": chosen.rule_max if chosen else "",
+                        "chosen_market_unit": chosen.unit if chosen else "",
+                        "chosen_comparable_rule_min": comparable_min if chosen else "",
+                        "chosen_comparable_rule_max": comparable_max if chosen else "",
+                        "chosen_comparable_unit": comparable_unit if chosen else "",
                         "trade_notional_usdc": config["trading"]["buy_notional_usdc"] if chosen else "",
                         "polymarket_url": event_url,
                         "wunderground_source_url": wu_source,
@@ -894,14 +962,19 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         )
                     )
                     LOGGER.info(
-                        "[%s] buy city=%s kind=%s station=%s forecast=%s market=%s price=%s",
+                        "[%s] buy city=%s kind=%s station=%s forecast=%s%s market=%s price=%s market_unit=%s comparable_rule=%s-%s%s",
                         cycle_id,
                         event["_parsed_city"],
                         event["_parsed_kind"],
                         station,
                         forecast_temp,
+                        forecast_unit,
                         chosen.market_id,
                         chosen.yes_price,
+                        chosen.unit,
+                        comparable_min,
+                        comparable_max,
+                        comparable_unit,
                     )
                 else:
                     log_method = LOGGER.info if not window_allowed else LOGGER.warning
@@ -946,6 +1019,10 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "chosen_yes_price": "",
                         "chosen_rule_min": "",
                         "chosen_rule_max": "",
+                        "chosen_market_unit": "",
+                        "chosen_comparable_rule_min": "",
+                        "chosen_comparable_rule_max": "",
+                        "chosen_comparable_unit": "",
                         "trade_notional_usdc": "",
                         "polymarket_url": event_url,
                         "wunderground_source_url": "",
