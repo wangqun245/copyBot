@@ -142,6 +142,9 @@ def default_config() -> dict[str, Any]:
             "fee_rate": 0.05,
             "fee_enabled": True,
             "one_trade_per_event_per_cycle": True,
+            "time_windows_enabled": True,
+            "lowest_local_hour_window": "0-8",
+            "highest_local_hour_window": "12-18",
         },
         "scheduler": {
             "poll_interval_minutes": 15,
@@ -437,6 +440,48 @@ def parse_twc_local_time(value: str) -> Optional[datetime]:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def first_twc_local_time(payload: dict[str, Any]) -> Optional[datetime]:
+    for raw_time in payload.get("validTimeLocal") or []:
+        parsed = parse_twc_local_time(str(raw_time))
+        if parsed:
+            return parsed
+    return None
+
+
+def parse_hour_window(value: str) -> tuple[int, int]:
+    start_text, end_text = str(value).split("-", 1)
+    start, end = int(start_text), int(end_text)
+    if not 0 <= start <= 23 or not 0 <= end <= 24:
+        raise ValueError(f"Invalid hour window: {value}")
+    return start, end
+
+
+def hour_in_window(hour: int, window: tuple[int, int]) -> bool:
+    start, end = window
+    if start == end:
+        return True
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def trading_window_status(config: dict[str, Any], kind: str, local_dt: Optional[datetime]) -> tuple[bool, str, str]:
+    if not config["trading"].get("time_windows_enabled", True):
+        return True, "", "time_windows_disabled"
+    if local_dt is None:
+        return False, "", "missing_twc_local_time"
+
+    if kind == "Lowest":
+        window_text = str(config["trading"]["lowest_local_hour_window"])
+    else:
+        window_text = str(config["trading"]["highest_local_hour_window"])
+
+    window = parse_hour_window(window_text)
+    allowed = hour_in_window(local_dt.hour, window)
+    reason = "inside_local_window" if allowed else f"outside_local_window_{window_text}"
+    return allowed, window_text, reason
 
 
 def twc_hourly_forecast_by_icao(config: dict[str, Any], icao_code: str) -> dict[str, Any]:
@@ -790,7 +835,13 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                 high, low, first_local, last_local = summarize_twc_daily_forecast(payload, event["_parsed_event_date"])
                 daily_times, daily_temps = twc_daily_series(payload, event["_parsed_event_date"])
                 forecast_temp = high if event["_parsed_kind"] == "Highest" else low
-                chosen = choose_most_likely_market(markets, forecast_temp)
+                city_local_dt = first_twc_local_time(payload)
+                window_allowed, window_text, window_reason = trading_window_status(
+                    config,
+                    event["_parsed_kind"],
+                    city_local_dt,
+                )
+                chosen = choose_most_likely_market(markets, forecast_temp) if window_allowed else None
                 observed_at = datetime.now().isoformat(timespec="seconds")
 
                 snapshot_rows.append(
@@ -805,6 +856,10 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "forecast_high": high,
                         "forecast_low": low,
                         "forecast_unit": "F" if config["api"]["twc_units"] == "e" else "C",
+                        "city_local_time": city_local_dt.isoformat() if city_local_dt else "",
+                        "trade_window": window_text,
+                        "trade_window_allowed": window_allowed,
+                        "trade_window_reason": window_reason,
                         "first_valid_time_local": first_local,
                         "last_valid_time_local": last_local,
                         "chosen_market_id": chosen.market_id if chosen else "",
@@ -849,12 +904,15 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         chosen.yes_price,
                     )
                 else:
-                    LOGGER.warning(
-                        "[%s] no usable market city=%s kind=%s forecast=%s",
+                    log_method = LOGGER.info if not window_allowed else LOGGER.warning
+                    log_method(
+                        "[%s] skip city=%s kind=%s forecast=%s reason=%s local_time=%s",
                         cycle_id,
                         event["_parsed_city"],
                         event["_parsed_kind"],
                         forecast_temp,
+                        window_reason if not window_allowed else "no_usable_market",
+                        city_local_dt.isoformat() if city_local_dt else "",
                     )
             except Exception as exc:
                 LOGGER.exception(
@@ -876,6 +934,10 @@ def run_cycle(config: dict[str, Any], cycle_num: int) -> int:
                         "forecast_high": "",
                         "forecast_low": "",
                         "forecast_unit": "",
+                        "city_local_time": "",
+                        "trade_window": "",
+                        "trade_window_allowed": "",
+                        "trade_window_reason": "event_error",
                         "first_valid_time_local": "",
                         "last_valid_time_local": "",
                         "chosen_market_id": "",

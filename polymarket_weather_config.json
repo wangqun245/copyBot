@@ -21,7 +21,10 @@
     "buy_notional_usdc": 5.0,
     "fee_rate": 0.05,
     "fee_enabled": true,
-    "one_trade_per_event_per_cycle": true
+    "one_trade_per_event_per_cycle": true,
+    "time_windows_enabled": true,
+    "lowest_local_hour_window": "0-8",
+    "highest_local_hour_window": "12-18"
   },
   "scheduler": {
     "poll_interval_minutes": 15,
