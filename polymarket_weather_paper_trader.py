@@ -15,6 +15,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -227,10 +228,68 @@ def default_config() -> dict[str, Any]:
             "settled_trades_csv": "polymarket_weather_trades_settled.csv",
             "performance_by_cycle_csv": "polymarket_weather_performance_by_cycle.csv",
             "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
+            "metar_csv": "aviation_weather_metar.csv",
             "state_json": "polymarket_weather_state.json",
             "log_file": "bot.log",
             "log_level": "INFO",
             "console_log_enabled": False,
+        },
+        "metar": {
+            "enabled": True,
+            "base_url": "https://aviationweather.gov/data/metar/",
+            "run_every_minutes": 5,
+            "decoded": True,
+            "station_codes": {
+                "London": "EGLC",
+                "Paris": "LFPB",
+                "Sao Paulo": "SBGR",
+                "Buenos Aires": "SAEZ",
+                "Seoul": "RKSI",
+                "Toronto": "CYYZ",
+                "Seattle": "KSEA",
+                "NYC": "KLGA",
+                "Dallas": "KDAL",
+                "Atlanta": "KATL",
+                "Miami": "KMIA",
+                "Chicago": "KORD",
+                "Ankara": "LTAC",
+                "Wellington": "NZWN",
+                "Lucknow": "VILK",
+                "Munich": "EDDM",
+                "Tel Aviv": "LLBG",
+                "Tokyo": "RJTT",
+                "Hong Kong": "VHHH",
+                "Shanghai": "ZSPD",
+                "Singapore": "WSSS",
+                "Milan": "LIMC",
+                "Madrid": "LEMD",
+                "Warsaw": "EPWA",
+                "Taipei": "RCSS",
+                "Chongqing": "ZUCK",
+                "Beijing": "ZBAA",
+                "Wuhan": "ZHHH",
+                "Chengdu": "ZUUU",
+                "Shenzhen": "ZGSZ",
+                "Austin": "KAUS",
+                "Denver": "KBKF",
+                "Houston": "KHOU",
+                "Los Angeles": "KLAX",
+                "San Francisco": "KSFO",
+                "Moscow": "UUEE",
+                "Istanbul": "LTFM",
+                "Mexico City": "MMMX",
+                "Busan": "RKPK",
+                "Amsterdam": "EHAM",
+                "Helsinki": "EFHK",
+                "Panama City": "MPMG",
+                "Kuala Lumpur": "WMKK",
+                "Jeddah": "OEJN",
+                "Cape Town": "FACT",
+                "Guangzhou": "ZGGG",
+                "Qingdao": "ZSQD",
+                "Karachi": "OPKC",
+                "Manila": "RPLL",
+            },
         },
         "strategies": [
             {
@@ -265,6 +324,26 @@ def default_config() -> dict[str, Any]:
                     "tomorrow_mispricing_local_hour_window": "12-24",
                     "forecast_scope": "event_day_full",
                     "forecast_horizon_hours": 6,
+                    "include_observed_today": False,
+                },
+            },
+            {
+                "name": "dual_bracket_fixed_time",
+                "enabled": True,
+                "run_every_minutes": 15,
+                "align_to_top_of_hour": False,
+                "events": {"target_dates": ["today"]},
+                "trading": {
+                    "strategy_name": "dual_bracket_fixed_time",
+                    "strategy_mode": "dual_bracket_fixed_time",
+                    "mispricing_price_threshold": 0.5,
+                    "time_windows_enabled": True,
+                    "dual_bracket_lowest_local_hour": 1,
+                    "dual_bracket_highest_local_hour": 13,
+                    "dual_bracket_max_markets_per_event": 2,
+                    "dual_bracket_allow_repeat_buys": False,
+                    "forecast_scope": "event_day_full",
+                    "forecast_horizon_hours": 24,
                     "include_observed_today": False,
                 },
             },
@@ -479,6 +558,8 @@ def parse_temperature_rule(text: str, default_unit: str = "F") -> tuple[Optional
     nums = [(float(n), (u or inferred_unit).upper()) for n, u in TEMP_NUMBER_RE.findall(normalized)]
     unit = nums[0][1] if nums else inferred_unit
     values = [n for n, _ in nums]
+    if len(values) >= 2 and re.search(r"\d\s*-\s*\d", normalized) and values[0] >= 0 and values[1] < 0:
+        values[1] = abs(values[1])
     if not values:
         return None, None, unit
 
@@ -879,6 +960,57 @@ def choose_most_likely_market(
     return sorted(usable, key=lambda m: canonical_market_distance(forecasts_by_unit, m, kind))[0] if usable else None
 
 
+def candidate_pair_from_forecast(value: Optional[float]) -> list[int]:
+    if value is None:
+        return []
+    lower = math.floor(float(value))
+    return [lower, lower + 1]
+
+
+def market_contains_temperature(market: TemperatureMarket, target_temp: float, target_unit: str) -> bool:
+    lo, hi, _ = comparable_rule_bounds(market, target_unit)
+    if lo is not None and target_temp < lo:
+        return False
+    if hi is not None and target_temp > hi:
+        return False
+    return lo is not None or hi is not None
+
+
+def choose_dual_bracket_markets(
+    markets: list[TemperatureMarket],
+    target_temps: list[int],
+    target_unit: str,
+    price_threshold: float,
+    max_markets: int,
+) -> list[TemperatureMarket]:
+    ranked: list[tuple[int, float, str, TemperatureMarket]] = []
+    seen: set[str] = set()
+    for target in target_temps:
+        for market in markets:
+            if market.market_id in seen:
+                continue
+            if market.yes_price is None or market.yes_price <= 0 or market.yes_price >= price_threshold:
+                continue
+            if (market.unit or target_unit).upper() != target_unit.upper():
+                continue
+            if not market_contains_temperature(market, float(target), target_unit):
+                continue
+            distance = market_distance(float(target), market, target_unit)
+            ranked.append((target_temps.index(target), float(market.yes_price), market.market_id, market))
+            seen.add(market.market_id)
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in ranked[:max_markets]]
+
+
+def existing_open_or_closed_trade_keys(config: dict[str, Any], strategy_name: str) -> set[tuple[str, str, str, str]]:
+    keys: set[tuple[str, str, str, str]] = set()
+    for trade in read_trades(config["outputs"]["trades_csv"]):
+        if trade.strategy != strategy_name:
+            continue
+        keys.add((trade.event_date, trade.city, trade.kind, trade.market_id))
+    return keys
+
+
 def taker_fee_usdc(shares: float, price: float, fee_rate: float, fee_enabled: bool) -> float:
     if not fee_enabled:
         return 0.0
@@ -955,10 +1087,15 @@ def build_trade(
 def append_csv(path: str, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    fieldnames = sorted({k for row in rows for k in row.keys()})
     exists = os.path.exists(path) and os.path.getsize(path) > 0
+    if exists:
+        with open(path, newline="", encoding="utf-8") as existing_file:
+            reader = csv.reader(existing_file)
+            fieldnames = next(reader, [])
+    else:
+        fieldnames = sorted({k for row in rows for k in row.keys()})
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         if not exists:
             writer.writeheader()
         writer.writerows(rows)
@@ -1328,7 +1465,384 @@ def strategy_due(
     return False, f"only_elapsed_{int(elapsed_seconds)}s"
 
 
+def dual_bracket_targets(
+    kind: str,
+    market_unit: str,
+    payload_f: dict[str, Any],
+    payload_c: dict[str, Any],
+    event_date: str,
+) -> tuple[list[int], dict[str, Any]]:
+    high_f, low_f, first_f, last_f = summarize_twc_daily_forecast(payload_f, event_date)
+    high_c, low_c, first_c, last_c = summarize_twc_daily_forecast(payload_c, event_date)
+    source_f = high_f if kind == "Highest" else low_f
+    source_c = high_c if kind == "Highest" else low_c
+    if market_unit == "C":
+        converted_f = convert_temperature(source_f, "F", "C")
+        raw_candidates = candidate_pair_from_forecast(converted_f) + candidate_pair_from_forecast(source_c)
+    else:
+        converted_c = convert_temperature(source_c, "C", "F")
+        raw_candidates = candidate_pair_from_forecast(source_f) + candidate_pair_from_forecast(converted_c)
+
+    targets: list[int] = []
+    for target in raw_candidates:
+        if target not in targets:
+            targets.append(target)
+    return targets, {
+        "high_f": high_f,
+        "low_f": low_f,
+        "first_f": first_f,
+        "last_f": last_f,
+        "high_c": high_c,
+        "low_c": low_c,
+        "first_c": first_c,
+        "last_c": last_c,
+        "source_f": source_f,
+        "source_c": source_c,
+        "converted_f_to_c": convert_temperature(source_f, "F", "C"),
+        "converted_c_to_f": convert_temperature(source_c, "C", "F"),
+    }
+
+
+def run_dual_bracket_strategy_cycle(config: dict[str, Any], cycle_id: str) -> int:
+    target_dates = [resolve_date(str(v)) for v in config["events"]["target_dates"]]
+    strategy_name = str(config["trading"]["strategy_name"])
+    price_threshold = float(config["trading"].get("mispricing_price_threshold", 0.5))
+    max_markets = int(config["trading"].get("dual_bracket_max_markets_per_event", 2))
+    low_hour = int(config["trading"].get("dual_bracket_lowest_local_hour", 1))
+    high_hour = int(config["trading"].get("dual_bracket_highest_local_hour", 13))
+    allow_repeat_buys = bool(config["trading"].get("dual_bracket_allow_repeat_buys", False))
+    existing_keys = set() if allow_repeat_buys else existing_open_or_closed_trade_keys(config, strategy_name)
+    all_new_trades: list[PaperTrade] = []
+    snapshot_rows: list[dict[str, Any]] = []
+
+    for target in target_dates:
+        events = discover_temperature_events(config, target)
+        log_info(f"[{cycle_id}] strategy={strategy_name} target={target.isoformat()} events={len(events)}")
+        for event in events:
+            markets = markets_for_event(config, event)
+            event_url = poly_url_from_event(event)
+            observed_at = datetime.now().isoformat(timespec="seconds")
+            try:
+                kind = event["_parsed_kind"]
+                city = event["_parsed_city"]
+                city_local_dt, city_timezone, city_time_source = city_local_now(config, city)
+                target_hour = low_hour if kind == "Lowest" else high_hour
+                if city_local_dt is None or city_local_dt.hour != target_hour:
+                    snapshot_rows.append(
+                        {
+                            "cycle_id": cycle_id,
+                            "strategy": strategy_name,
+                            "observed_at": observed_at,
+                            "target_date": target.isoformat(),
+                            "city": city,
+                            "kind": kind,
+                            "station": "",
+                            "event_market_unit": event_market_unit(markets),
+                            "twc_units_requested": "",
+                            "forecast_temp": "",
+                            "forecast_high": "",
+                            "forecast_low": "",
+                            "forecast_unit": "",
+                            "forecast_high_f": "",
+                            "forecast_low_f": "",
+                            "forecast_high_c": "",
+                            "forecast_low_c": "",
+                            "forecast_horizon_hours": "",
+                            "include_observed_today": False,
+                            "observed_point_count_f": "",
+                            "forecast_point_count_f": "",
+                            "combined_point_count_f": "",
+                            "observed_point_count_c": "",
+                            "forecast_point_count_c": "",
+                            "combined_point_count_c": "",
+                            "city_local_time": city_local_dt.isoformat() if city_local_dt else "",
+                            "city_timezone": city_timezone,
+                            "city_time_source": city_time_source,
+                            "trade_window": f"{target_hour}:00",
+                            "trade_window_allowed": False,
+                            "trade_window_reason": f"outside_fixed_local_hour_{target_hour}",
+                            "first_valid_time_local": "",
+                            "last_valid_time_local": "",
+                            "chosen_market_id": "",
+                            "chosen_condition_id": "",
+                            "chosen_question": "",
+                            "chosen_yes_price": "",
+                            "mispricing_price_threshold": price_threshold,
+                            "pricing_edge": "",
+                            "should_buy": False,
+                            "chosen_rule_min": "",
+                            "chosen_rule_max": "",
+                            "chosen_market_unit": "",
+                            "chosen_comparable_rule_min": "",
+                            "chosen_comparable_rule_max": "",
+                            "chosen_comparable_unit": "",
+                            "trade_notional_usdc": "",
+                            "polymarket_url": event_url,
+                            "wunderground_source_url": "",
+                            "twc_valid_time_local_f_json": "",
+                            "twc_temperature_f_json": "",
+                            "twc_raw_payload_f_json": "",
+                            "twc_observed_time_local_f_json": "",
+                            "twc_observed_temperature_f_json": "",
+                            "twc_raw_historical_payload_f_json": "",
+                            "twc_valid_time_local_c_json": "",
+                            "twc_temperature_c_json": "",
+                            "twc_raw_payload_c_json": "",
+                            "twc_observed_time_local_c_json": "",
+                            "twc_observed_temperature_c_json": "",
+                            "twc_raw_historical_payload_c_json": "",
+                            "error": "",
+                        }
+                    )
+                    continue
+
+                wu_source = extract_wunderground_source(config, event_url)
+                station = station_from_wu_url(wu_source)
+                if not station:
+                    raise RuntimeError("No ICAO station code found in Wunderground source URL.")
+
+                event_unit = event_market_unit(markets)
+                payload_f = twc_hourly_forecast_by_icao(config, station, units="e")
+                payload_c = twc_hourly_forecast_by_icao(config, station, units="m")
+                targets, forecast_meta = dual_bracket_targets(kind, event_unit, payload_f, payload_c, event["_parsed_event_date"])
+                chosen_markets = choose_dual_bracket_markets(markets, targets, event_unit, price_threshold, max_markets)
+                chosen_markets = [
+                    market
+                    for market in chosen_markets
+                    if (market.event_date, market.city, market.kind, market.market_id) not in existing_keys
+                ][:max_markets]
+
+                forecast_high = forecast_meta["high_c"] if event_unit == "C" else forecast_meta["high_f"]
+                forecast_low = forecast_meta["low_c"] if event_unit == "C" else forecast_meta["low_f"]
+                forecast_temp = forecast_high if kind == "Highest" else forecast_low
+                first_local = forecast_meta["first_c"] if event_unit == "C" else forecast_meta["first_f"]
+                last_local = forecast_meta["last_c"] if event_unit == "C" else forecast_meta["last_f"]
+                daily_times_f, daily_temps_f = twc_daily_series(payload_f, event["_parsed_event_date"])
+                daily_times_c, daily_temps_c = twc_daily_series(payload_c, event["_parsed_event_date"])
+
+                if not chosen_markets:
+                    snapshot_rows.append(
+                        {
+                            "cycle_id": cycle_id,
+                            "strategy": strategy_name,
+                            "observed_at": datetime.now().isoformat(timespec="seconds"),
+                            "target_date": target.isoformat(),
+                            "city": city,
+                            "kind": kind,
+                            "station": station,
+                            "event_market_unit": event_unit,
+                            "twc_units_requested": "e,m",
+                            "forecast_temp": forecast_temp,
+                            "forecast_high": forecast_high,
+                            "forecast_low": forecast_low,
+                            "forecast_unit": event_unit,
+                            "forecast_high_f": forecast_meta["high_f"],
+                            "forecast_low_f": forecast_meta["low_f"],
+                            "forecast_high_c": forecast_meta["high_c"],
+                            "forecast_low_c": forecast_meta["low_c"],
+                            "forecast_horizon_hours": 24,
+                            "include_observed_today": False,
+                            "observed_point_count_f": "",
+                            "forecast_point_count_f": len(daily_temps_f),
+                            "combined_point_count_f": len(daily_temps_f),
+                            "observed_point_count_c": "",
+                            "forecast_point_count_c": len(daily_temps_c),
+                            "combined_point_count_c": len(daily_temps_c),
+                            "city_local_time": city_local_dt.isoformat(),
+                            "city_timezone": city_timezone,
+                            "city_time_source": city_time_source,
+                            "trade_window": f"{target_hour}:00",
+                            "trade_window_allowed": True,
+                            "trade_window_reason": "inside_fixed_local_hour",
+                            "first_valid_time_local": first_local,
+                            "last_valid_time_local": last_local,
+                            "chosen_market_id": "",
+                            "chosen_condition_id": "",
+                            "chosen_question": "",
+                            "chosen_yes_price": "",
+                            "mispricing_price_threshold": price_threshold,
+                            "pricing_edge": "",
+                            "should_buy": False,
+                            "chosen_rule_min": "",
+                            "chosen_rule_max": "",
+                            "chosen_market_unit": "",
+                            "chosen_comparable_rule_min": "",
+                            "chosen_comparable_rule_max": "",
+                            "chosen_comparable_unit": event_unit,
+                            "trade_notional_usdc": "",
+                            "polymarket_url": event_url,
+                            "wunderground_source_url": wu_source,
+                            "twc_valid_time_local_f_json": json.dumps(daily_times_f, ensure_ascii=False),
+                            "twc_temperature_f_json": json.dumps(daily_temps_f, ensure_ascii=False),
+                            "twc_raw_payload_f_json": json.dumps(payload_f, ensure_ascii=False, sort_keys=True),
+                            "twc_observed_time_local_f_json": "",
+                            "twc_observed_temperature_f_json": "",
+                            "twc_raw_historical_payload_f_json": "",
+                            "twc_valid_time_local_c_json": json.dumps(daily_times_c, ensure_ascii=False),
+                            "twc_temperature_c_json": json.dumps(daily_temps_c, ensure_ascii=False),
+                            "twc_raw_payload_c_json": json.dumps(payload_c, ensure_ascii=False, sort_keys=True),
+                            "twc_observed_time_local_c_json": "",
+                            "twc_observed_temperature_c_json": "",
+                            "twc_raw_historical_payload_c_json": "",
+                            "error": f"no_markets_under_threshold_for_targets_{targets}",
+                        }
+                    )
+                    LOGGER.info(
+                        "[%s] skip strategy=%s city=%s kind=%s station=%s targets=%s reason=no_markets_under_threshold threshold=%s",
+                        cycle_id,
+                        strategy_name,
+                        city,
+                        kind,
+                        station,
+                        targets,
+                        price_threshold,
+                    )
+                    continue
+
+                for chosen in chosen_markets:
+                    comparable_min, comparable_max, comparable_unit = comparable_rule_bounds(chosen, event_unit)
+                    snapshot_rows.append(
+                        {
+                            "cycle_id": cycle_id,
+                            "strategy": strategy_name,
+                            "observed_at": datetime.now().isoformat(timespec="seconds"),
+                            "target_date": target.isoformat(),
+                            "city": city,
+                            "kind": kind,
+                            "station": station,
+                            "event_market_unit": event_unit,
+                            "twc_units_requested": "e,m",
+                            "forecast_temp": forecast_temp,
+                            "forecast_high": forecast_high,
+                            "forecast_low": forecast_low,
+                            "forecast_unit": event_unit,
+                            "forecast_high_f": forecast_meta["high_f"],
+                            "forecast_low_f": forecast_meta["low_f"],
+                            "forecast_high_c": forecast_meta["high_c"],
+                            "forecast_low_c": forecast_meta["low_c"],
+                            "forecast_horizon_hours": 24,
+                            "include_observed_today": False,
+                            "observed_point_count_f": "",
+                            "forecast_point_count_f": len(daily_temps_f),
+                            "combined_point_count_f": len(daily_temps_f),
+                            "observed_point_count_c": "",
+                            "forecast_point_count_c": len(daily_temps_c),
+                            "combined_point_count_c": len(daily_temps_c),
+                            "city_local_time": city_local_dt.isoformat(),
+                            "city_timezone": city_timezone,
+                            "city_time_source": city_time_source,
+                            "trade_window": f"{target_hour}:00",
+                            "trade_window_allowed": True,
+                            "trade_window_reason": "inside_fixed_local_hour",
+                            "first_valid_time_local": first_local,
+                            "last_valid_time_local": last_local,
+                            "chosen_market_id": chosen.market_id,
+                            "chosen_condition_id": chosen.condition_id,
+                            "chosen_question": chosen.market_question,
+                            "chosen_yes_price": chosen.yes_price,
+                            "mispricing_price_threshold": price_threshold,
+                            "pricing_edge": round(1.0 - float(chosen.yes_price), 8) if chosen.yes_price is not None else "",
+                            "should_buy": True,
+                            "chosen_rule_min": chosen.rule_min,
+                            "chosen_rule_max": chosen.rule_max,
+                            "chosen_market_unit": chosen.unit,
+                            "chosen_comparable_rule_min": comparable_min,
+                            "chosen_comparable_rule_max": comparable_max,
+                            "chosen_comparable_unit": comparable_unit,
+                            "trade_notional_usdc": config["trading"]["buy_notional_usdc"],
+                            "polymarket_url": event_url,
+                            "wunderground_source_url": wu_source,
+                            "twc_valid_time_local_f_json": json.dumps(daily_times_f, ensure_ascii=False),
+                            "twc_temperature_f_json": json.dumps(daily_temps_f, ensure_ascii=False),
+                            "twc_raw_payload_f_json": json.dumps(payload_f, ensure_ascii=False, sort_keys=True),
+                            "twc_observed_time_local_f_json": "",
+                            "twc_observed_temperature_f_json": "",
+                            "twc_raw_historical_payload_f_json": "",
+                            "twc_valid_time_local_c_json": json.dumps(daily_times_c, ensure_ascii=False),
+                            "twc_temperature_c_json": json.dumps(daily_temps_c, ensure_ascii=False),
+                            "twc_raw_payload_c_json": json.dumps(payload_c, ensure_ascii=False, sort_keys=True),
+                            "twc_observed_time_local_c_json": "",
+                            "twc_observed_temperature_c_json": "",
+                            "twc_raw_historical_payload_c_json": "",
+                            "error": "",
+                        }
+                    )
+                    new_trade = build_trade(
+                        config,
+                        cycle_id,
+                        chosen,
+                        wu_source,
+                        station,
+                        forecast_temp,
+                        forecast_high,
+                        forecast_low,
+                        first_local,
+                        last_local,
+                    )
+                    all_new_trades.append(new_trade)
+                    existing_keys.add((chosen.event_date, chosen.city, chosen.kind, chosen.market_id))
+                    LOGGER.info(
+                        "[%s] buy strategy=%s trade=%s city=%s kind=%s station=%s targets=%s forecast=%s%s market=%s price=%s threshold=%s notional=%s shares=%s total_cost=%s rule=%s-%s%s",
+                        cycle_id,
+                        strategy_name,
+                        new_trade.trade_id,
+                        city,
+                        kind,
+                        station,
+                        targets,
+                        forecast_temp,
+                        event_unit,
+                        chosen.market_id,
+                        chosen.yes_price,
+                        price_threshold,
+                        new_trade.notional_usdc,
+                        new_trade.shares,
+                        new_trade.total_cost_usdc,
+                        comparable_min,
+                        comparable_max,
+                        comparable_unit,
+                    )
+            except Exception as exc:
+                LOGGER.exception("[%s] event failed city=%s kind=%s url=%s", cycle_id, event.get("_parsed_city", ""), event.get("_parsed_kind", ""), event_url)
+                snapshot_rows.append(
+                    {
+                        "cycle_id": cycle_id,
+                        "strategy": strategy_name,
+                        "observed_at": datetime.now().isoformat(timespec="seconds"),
+                        "target_date": target.isoformat(),
+                        "city": event.get("_parsed_city", ""),
+                        "kind": event.get("_parsed_kind", ""),
+                        "station": "",
+                        "event_market_unit": "",
+                        "twc_units_requested": "e,m",
+                        "forecast_temp": "",
+                        "forecast_high": "",
+                        "forecast_low": "",
+                        "forecast_unit": "",
+                        "forecast_high_f": "",
+                        "forecast_low_f": "",
+                        "forecast_high_c": "",
+                        "forecast_low_c": "",
+                        "forecast_horizon_hours": 24,
+                        "include_observed_today": False,
+                        "trade_window_reason": "event_error",
+                        "should_buy": "",
+                        "polymarket_url": event_url,
+                        "error": repr(exc),
+                    }
+                )
+            time.sleep(float(config["api"]["per_request_delay_seconds"]))
+
+    append_csv(config["outputs"]["snapshots_csv"], snapshot_rows)
+    append_csv(config["outputs"]["trades_csv"], [asdict(t) for t in all_new_trades])
+    log_info(f"[{cycle_id}] strategy={strategy_name} snapshots={len(snapshot_rows)} new_trades={len(all_new_trades)}")
+    return len(all_new_trades)
+
+
 def run_strategy_cycle(config: dict[str, Any], cycle_id: str) -> int:
+    if config["trading"].get("strategy_mode") == "dual_bracket_fixed_time":
+        return run_dual_bracket_strategy_cycle(config, cycle_id)
+
     target_dates = [resolve_date(str(v)) for v in config["events"]["target_dates"]]
     all_new_trades: list[PaperTrade] = []
     snapshot_rows: list[dict[str, Any]] = []
@@ -1700,6 +2214,84 @@ def run_cycle(config: dict[str, Any], cycle_num: int, last_run_at: dict[str, dat
     return total_new_trades
 
 
+def metar_due(config: dict[str, Any], now: datetime, last_run_at: Optional[datetime]) -> tuple[bool, str]:
+    if not config.get("metar", {}).get("enabled", False):
+        return False, "disabled"
+    interval = int(config["metar"].get("run_every_minutes", 5)) * 60
+    if last_run_at is None:
+        return True, "first_run"
+    elapsed = int((now - last_run_at).total_seconds())
+    if elapsed >= interval:
+        return True, f"elapsed_{elapsed}s"
+    return False, f"only_elapsed_{elapsed}s"
+
+
+def collect_metar(config: dict[str, Any], cycle_id: str) -> int:
+    metar_config = config.get("metar", {})
+    if not metar_config.get("enabled", False):
+        return 0
+    station_codes = metar_config.get("station_codes") or {}
+    if not station_codes:
+        LOGGER.info("[%s] metar skipped: no station codes configured", cycle_id)
+        return 0
+
+    timeout = int(config["api"]["request_timeout_seconds"])
+    base_url = str(metar_config.get("base_url", "https://aviationweather.gov/data/metar/"))
+    decoded = "1" if metar_config.get("decoded", True) else "0"
+    rows: list[dict[str, Any]] = []
+    for city, station in sorted(station_codes.items()):
+        station = str(station).strip().upper()
+        if not station:
+            continue
+        fetched_at = datetime.now().isoformat(timespec="seconds")
+        params = {"decoded": decoded, "ids": station}
+        url = requests.Request("GET", base_url, params=params).prepare().url or base_url
+        row = {
+            "cycle_id": cycle_id,
+            "fetched_at": fetched_at,
+            "city": city,
+            "station": station,
+            "url": url,
+            "status_code": "",
+            "content_type": "",
+            "last_modified": "",
+            "etag": "",
+            "raw_response": "",
+            "error": "",
+        }
+        try:
+            response = requests.get(base_url, headers=HEADERS, params=params, timeout=timeout)
+            row["status_code"] = response.status_code
+            row["content_type"] = response.headers.get("content-type", "")
+            row["last_modified"] = response.headers.get("last-modified", "")
+            row["etag"] = response.headers.get("etag", "")
+            row["raw_response"] = response.text
+            if response.status_code >= 400:
+                row["error"] = f"HTTP {response.status_code}"
+                LOGGER.warning("[%s] metar failed city=%s station=%s status=%s", cycle_id, city, station, response.status_code)
+            else:
+                LOGGER.info("[%s] metar city=%s station=%s bytes=%s", cycle_id, city, station, len(response.text))
+        except Exception as exc:
+            row["error"] = repr(exc)
+            LOGGER.exception("[%s] metar exception city=%s station=%s", cycle_id, city, station)
+        rows.append(row)
+        time.sleep(float(config["api"]["per_request_delay_seconds"]))
+
+    append_csv(str(config["outputs"].get("metar_csv", "aviation_weather_metar.csv")), rows)
+    LOGGER.info("[%s] metar rows=%s", cycle_id, len(rows))
+    return len(rows)
+
+
+def loop_sleep_seconds(config: dict[str, Any]) -> int:
+    intervals = [int(config["scheduler"]["poll_interval_minutes"]) * 60]
+    if config.get("metar", {}).get("enabled", False):
+        intervals.append(int(config["metar"].get("run_every_minutes", 5)) * 60)
+    for strategy in config.get("strategies") or []:
+        if strategy.get("enabled", True):
+            intervals.append(int(strategy.get("run_every_minutes", config["scheduler"]["poll_interval_minutes"])) * 60)
+    return max(1, min(intervals))
+
+
 def write_state(config: dict[str, Any], cycle_num: int) -> None:
     state = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1710,6 +2302,7 @@ def write_state(config: dict[str, Any], cycle_num: int) -> None:
         "settled_trades_csv": config["outputs"]["settled_trades_csv"],
         "performance_by_cycle_csv": config["outputs"]["performance_by_cycle_csv"],
         "performance_by_event_csv": config["outputs"]["performance_by_event_csv"],
+        "metar_csv": config["outputs"].get("metar_csv", "aviation_weather_metar.csv"),
         "log_file": config["outputs"]["log_file"],
     }
     with open(config["outputs"]["state_json"], "w", encoding="utf-8") as f:
@@ -1738,11 +2331,20 @@ def summarize_settled(config: dict[str, Any]) -> None:
 def run(config: dict[str, Any]) -> None:
     cycle_num = 0
     last_run_at: dict[str, datetime] = {}
+    last_metar_run_at: Optional[datetime] = None
     max_cycles = int(config["scheduler"]["max_cycles"])
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
     while True:
         cycle_num += 1
+        now = datetime.now()
+        base_cycle_id = now.strftime("%Y%m%dT%H%M%S") + f"-{cycle_num}"
         run_cycle(config, cycle_num, last_run_at)
+        due, reason = metar_due(config, datetime.now(), last_metar_run_at)
+        if due:
+            collect_metar(config, f"{base_cycle_id}:metar")
+            last_metar_run_at = datetime.now()
+        else:
+            LOGGER.info("[%s] metar not due reason=%s", base_cycle_id, reason)
         process_strategy_exits(config)
         if config["scheduler"]["settle_after_each_cycle"]:
             settle_open_trades(config)
@@ -1762,7 +2364,7 @@ def run(config: dict[str, Any]) -> None:
             next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
             sleep_seconds = max(1, int((next_hour - now).total_seconds()))
         else:
-            sleep_seconds = int(config["scheduler"]["poll_interval_minutes"]) * 60
+            sleep_seconds = loop_sleep_seconds(config)
         log_info(f"sleeping {sleep_seconds} seconds")
         time.sleep(sleep_seconds)
 
