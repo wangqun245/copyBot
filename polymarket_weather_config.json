@@ -114,7 +114,6 @@
     "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
     "twc_raw_wide_csv": "polymarket_weather_twc_raw_wide.csv",
     "polymarket_price_snapshots_csv": "polymarket_weather_price_snapshots.csv",
-    "polymarket_websocket_raw_jsonl": "polymarket_weather_websocket_raw.jsonl",
     "state_json": "polymarket_weather_state.json",
     "log_file": "bot.log",
     "log_level": "INFO",

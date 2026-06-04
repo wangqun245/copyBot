@@ -252,7 +252,6 @@ def default_config() -> dict[str, Any]:
             "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
             "twc_raw_wide_csv": "polymarket_weather_twc_raw_wide.csv",
             "polymarket_price_snapshots_csv": "polymarket_weather_price_snapshots.csv",
-            "polymarket_websocket_raw_jsonl": "polymarket_weather_websocket_raw.jsonl",
             "state_json": "polymarket_weather_state.json",
             "log_file": "bot.log",
             "log_level": "INFO",
@@ -1328,13 +1327,6 @@ def append_csv(path: str, rows: list[dict[str, Any]]) -> None:
             writer.writerows(rows)
 
 
-def append_jsonl_text(path: str, text: str) -> None:
-    with IO_LOCK:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(text.rstrip("\r\n"))
-            f.write("\n")
-
-
 def read_csv_dicts(path: str) -> list[dict[str, str]]:
     if not os.path.exists(path):
         return []
@@ -2222,12 +2214,6 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
     persistent = bool(strategy_config["trading"].get("websocket_persistent", True))
     deadline = None if persistent else time.monotonic() + max(1, duration_seconds)
     next_ping = time.monotonic() + max(1, ping_seconds)
-    websocket_raw_jsonl = str(
-        config["outputs"].get(
-            "polymarket_websocket_raw_jsonl",
-            config["outputs"].get("polymarket_websocket_raw_csv", "polymarket_weather_websocket_raw.jsonl"),
-        )
-    )
     LOGGER.info(
         "strategy4 websocket connect assets=%s events=%s persistent=%s duration=%ss",
         len(asset_ids),
@@ -2255,7 +2241,6 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
             if raw_message in {"", "PONG", "PING"}:
                 continue
             raw_text = raw_message.decode("utf-8", errors="replace") if isinstance(raw_message, bytes) else str(raw_message)
-            append_jsonl_text(websocket_raw_jsonl, raw_text)
             try:
                 message = json.loads(raw_text)
             except (TypeError, ValueError):
