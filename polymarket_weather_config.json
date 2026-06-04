@@ -13,6 +13,7 @@
   "events": {
     "target_dates": ["today"],
     "city_filter": "",
+    "allowed_cities": ["Atlanta", "Austin", "Chicago", "Dallas", "Denver", "Houston", "Los Angeles", "Miami", "NYC", "San Francisco", "Seattle"],
     "include_closed": false,
     "max_offsets": 1200,
     "city_timezones": {
@@ -68,19 +69,34 @@
     }
   },
   "trading": {
-    "strategy_name": "twc_every_15m_most_likely",
-    "strategy_mode": "intraday_reactive",
+    "strategy_name": "twc_reprice_momentum",
+    "strategy_mode": "twc_reprice_momentum",
     "buy_notional_usdc": 5.0,
     "mispricing_price_threshold": 0.5,
     "fee_rate": 0.05,
     "fee_enabled": true,
     "one_trade_per_event_per_cycle": true,
     "time_windows_enabled": true,
-    "lowest_local_hour_window": "0-6",
-    "highest_local_hour_window": "12-18",
-    "forecast_horizon_hours": 6,
-    "forecast_scope": "next_hours_plus_observed",
-    "include_observed_today": true
+    "lowest_local_start": "00:15",
+    "highest_local_start": "12:15",
+    "lowest_local_end": "06:00",
+    "highest_local_end": "18:00",
+    "max_buy_yes_price": 0.5,
+    "monitor_price_change_trigger": 0.05,
+    "stop_loss_fraction_of_cost": 0.25,
+    "profit_drawdown_fraction": 0.3,
+    "profit_drawdown_min_profit_usdc": 1.0,
+    "websocket_peak_price_fields": ["price", "best_bid", "bid", "last_trade_price"],
+    "allowed_cities": ["Atlanta", "Austin", "Chicago", "Dallas", "Denver", "Houston", "Los Angeles", "Miami", "NYC", "San Francisco", "Seattle"],
+    "websocket_persistent": true,
+    "websocket_reconnect_seconds": 5,
+    "websocket_enabled": true,
+    "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    "websocket_ping_seconds": 10,
+    "websocket_timeout_seconds": 10,
+    "forecast_horizon_hours": 24,
+    "forecast_scope": "event_day_full",
+    "include_observed_today": false
   },
   "scheduler": {
     "poll_interval_minutes": 15,
@@ -98,83 +114,33 @@
     "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
     "twc_raw_wide_csv": "polymarket_weather_twc_raw_wide.csv",
     "polymarket_price_snapshots_csv": "polymarket_weather_price_snapshots.csv",
+    "polymarket_websocket_raw_jsonl": "polymarket_weather_websocket_raw.jsonl",
     "state_json": "polymarket_weather_state.json",
     "log_file": "bot.log",
     "log_level": "INFO",
     "console_log_enabled": false
   },
   "polymarket_price_snapshots": {
-    "enabled": true,
+    "enabled": false,
     "run_every_minutes": 1,
     "target_dates": ["today"],
     "time_windows_enabled": true,
     "lowest_local_hour_window": "0-6",
     "highest_local_hour_window": "12-18"
   },
+  "twc_raw_collection": {
+    "enabled": false,
+    "run_every_minutes": 15,
+    "target_dates": ["today"],
+    "time_windows_enabled": true,
+    "lowest_local_hour_window": "0-6",
+    "highest_local_hour_window": "12-18",
+    "forecast_scope": "next_hours_plus_observed",
+    "forecast_horizon_hours": 6,
+    "include_observed_today": true,
+    "strategy_name": "twc_raw_collector"
+  },
   "strategies": [
-    {
-      "name": "intraday_reactive",
-      "enabled": true,
-      "run_every_minutes": 15,
-      "align_to_top_of_hour": false,
-      "events": {
-        "target_dates": ["today"]
-      },
-      "trading": {
-        "strategy_name": "intraday_reactive",
-        "strategy_mode": "intraday_reactive",
-        "mispricing_price_threshold": 0.5,
-        "time_windows_enabled": true,
-        "lowest_local_hour_window": "0-6",
-        "highest_local_hour_window": "12-18",
-        "forecast_scope": "next_hours_plus_observed",
-        "forecast_horizon_hours": 6,
-        "include_observed_today": true
-      }
-    },
-    {
-      "name": "tomorrow_mispricing",
-      "enabled": true,
-      "run_every_minutes": 60,
-      "align_to_top_of_hour": true,
-      "events": {
-        "target_dates": ["tomorrow"]
-      },
-      "trading": {
-        "strategy_name": "tomorrow_mispricing",
-        "strategy_mode": "tomorrow_mispricing",
-        "mispricing_price_threshold": 0.5,
-        "time_windows_enabled": true,
-        "tomorrow_mispricing_local_hour_window": "12-24",
-        "forecast_scope": "event_day_full",
-        "forecast_horizon_hours": 6,
-        "include_observed_today": false
-      }
-    },
-    {
-      "name": "dual_bracket_fixed_time",
-      "enabled": true,
-      "run_every_minutes": 15,
-      "align_to_top_of_hour": false,
-      "events": {
-        "target_dates": ["today"]
-      },
-      "trading": {
-        "strategy_name": "dual_bracket_fixed_time",
-        "strategy_mode": "dual_bracket_fixed_time",
-        "mispricing_price_threshold": 0.5,
-        "time_windows_enabled": true,
-        "dual_bracket_lowest_local_hour": 0,
-        "dual_bracket_lowest_local_minute": 30,
-        "dual_bracket_highest_local_hour": 12,
-        "dual_bracket_highest_local_minute": 30,
-        "dual_bracket_max_markets_per_event": 2,
-        "dual_bracket_allow_repeat_buys": false,
-        "forecast_scope": "event_day_full",
-        "forecast_horizon_hours": 24,
-        "include_observed_today": false
-      }
-    },
     {
       "name": "twc_reprice_momentum",
       "enabled": true,
@@ -189,6 +155,13 @@
         "mispricing_price_threshold": 0.5,
         "max_buy_yes_price": 0.5,
         "monitor_price_change_trigger": 0.05,
+        "stop_loss_fraction_of_cost": 0.25,
+        "profit_drawdown_fraction": 0.3,
+        "profit_drawdown_min_profit_usdc": 1.0,
+        "websocket_peak_price_fields": ["price", "best_bid", "bid", "last_trade_price"],
+        "allowed_cities": ["Atlanta", "Austin", "Chicago", "Dallas", "Denver", "Houston", "Los Angeles", "Miami", "NYC", "San Francisco", "Seattle"],
+        "websocket_persistent": true,
+        "websocket_reconnect_seconds": 5,
         "websocket_enabled": true,
         "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         "websocket_ping_seconds": 10,

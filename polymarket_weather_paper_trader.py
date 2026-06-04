@@ -20,6 +20,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone, timedelta
@@ -32,6 +33,21 @@ import requests
 BASE_POLY = "https://polymarket.com"
 DEFAULT_CONFIG_PATH = "polymarket_weather_config.json"
 LOGGER = logging.getLogger("weatherbot")
+STRATEGY4_PEAK_PNL_BY_TRADE: dict[str, float] = {}
+IO_LOCK = threading.RLock()
+US_WEATHER_CITIES = {
+    "Atlanta",
+    "Austin",
+    "Chicago",
+    "Dallas",
+    "Denver",
+    "Houston",
+    "Los Angeles",
+    "Miami",
+    "NYC",
+    "San Francisco",
+    "Seattle",
+}
 
 HEADERS = {
     "User-Agent": (
@@ -115,6 +131,7 @@ class PaperTrade:
     monitor_last_yes_price: Optional[float] = None
     monitor_last_checked_at: str = ""
     monitor_price_trigger: float = 0.0
+    monitor_peak_pnl_usdc: float = 0.0
     status: str = "OPEN"
     settlement_source: str = ""
     winning_outcome: str = ""
@@ -149,6 +166,7 @@ def default_config() -> dict[str, Any]:
         "events": {
             "target_dates": ["today"],
             "city_filter": "",
+            "allowed_cities": sorted(US_WEATHER_CITIES),
             "include_closed": False,
             "max_offsets": 1200,
             "city_timezones": {
@@ -234,6 +252,7 @@ def default_config() -> dict[str, Any]:
             "performance_by_event_csv": "polymarket_weather_performance_by_event.csv",
             "twc_raw_wide_csv": "polymarket_weather_twc_raw_wide.csv",
             "polymarket_price_snapshots_csv": "polymarket_weather_price_snapshots.csv",
+            "polymarket_websocket_raw_jsonl": "polymarket_weather_websocket_raw.jsonl",
             "state_json": "polymarket_weather_state.json",
             "log_file": "bot.log",
             "log_level": "INFO",
@@ -246,6 +265,18 @@ def default_config() -> dict[str, Any]:
             "time_windows_enabled": True,
             "lowest_local_hour_window": "0-6",
             "highest_local_hour_window": "12-18",
+        },
+        "twc_raw_collection": {
+            "enabled": True,
+            "run_every_minutes": 15,
+            "target_dates": ["today"],
+            "time_windows_enabled": True,
+            "lowest_local_hour_window": "0-6",
+            "highest_local_hour_window": "12-18",
+            "forecast_scope": "next_hours_plus_observed",
+            "forecast_horizon_hours": 6,
+            "include_observed_today": True,
+            "strategy_name": "twc_raw_collector",
         },
         "strategies": [
             {
@@ -317,6 +348,13 @@ def default_config() -> dict[str, Any]:
                     "mispricing_price_threshold": 0.5,
                     "max_buy_yes_price": 0.5,
                     "monitor_price_change_trigger": 0.05,
+                    "stop_loss_fraction_of_cost": 0.25,
+                    "profit_drawdown_fraction": 0.3,
+                    "profit_drawdown_min_profit_usdc": 1.0,
+                    "websocket_peak_price_fields": ["price", "best_bid", "bid", "last_trade_price"],
+                    "allowed_cities": sorted(US_WEATHER_CITIES),
+                    "websocket_persistent": True,
+                    "websocket_reconnect_seconds": 5,
                     "websocket_enabled": True,
                     "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
                     "websocket_ping_seconds": 10,
@@ -334,10 +372,26 @@ def default_config() -> dict[str, Any]:
     }
 
 
+def strategy4_only_config(config: dict[str, Any]) -> dict[str, Any]:
+    strategies = [
+        strategy
+        for strategy in config.get("strategies", [])
+        if strategy.get("trading", {}).get("strategy_mode") == "twc_reprice_momentum"
+    ]
+    if not strategies:
+        raise RuntimeError("No strategy4/twc_reprice_momentum strategy found in config.")
+
+    config["strategies"] = strategies[:1]
+    config["trading"] = deep_merge(config.get("trading", {}), strategies[0].get("trading", {}))
+    config["polymarket_price_snapshots"]["enabled"] = False
+    config["twc_raw_collection"]["enabled"] = False
+    return config
+
+
 def load_config(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         user_config = json.load(f)
-    return deep_merge(default_config(), user_config)
+    return strategy4_only_config(deep_merge(default_config(), user_config))
 
 
 def setup_logging(config: dict[str, Any]) -> None:
@@ -462,6 +516,15 @@ def poly_url_from_event(event: dict[str, Any]) -> str:
 def discover_temperature_events(config: dict[str, Any], target: date) -> list[dict[str, Any]]:
     found: dict[str, dict[str, Any]] = {}
     city_filter = str(config["events"].get("city_filter") or "").lower()
+    allowed_cities = {
+        str(city)
+        for city in (
+            config["events"].get("allowed_cities")
+            or config["trading"].get("allowed_cities")
+            or []
+        )
+        if str(city)
+    }
     max_offsets = int(config["events"]["max_offsets"])
     queries = [
         {"tag_slug": "weather"},
@@ -496,6 +559,8 @@ def discover_temperature_events(config: dict[str, Any], target: date) -> list[di
                 if event_date != target:
                     continue
                 if city_filter and city_filter not in city.lower():
+                    continue
+                if allowed_cities and city not in allowed_cities:
                     continue
                 event["_parsed_kind"] = kind
                 event["_parsed_city"] = city
@@ -1240,33 +1305,42 @@ def build_trade(
 def append_csv(path: str, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    exists = os.path.exists(path) and os.path.getsize(path) > 0
-    if exists:
-        with open(path, newline="", encoding="utf-8") as existing_file:
-            reader = csv.reader(existing_file)
-            fieldnames = next(reader, [])
-        new_fields = sorted({k for row in rows for k in row.keys() if k not in fieldnames})
-        if new_fields:
-            existing_rows = read_csv_dicts(path)
-            fieldnames = fieldnames + new_fields
-            with open(path, "w", newline="", encoding="utf-8") as rewrite_file:
-                writer = csv.DictWriter(rewrite_file, fieldnames=fieldnames, extrasaction="ignore")
+    with IO_LOCK:
+        exists = os.path.exists(path) and os.path.getsize(path) > 0
+        if exists:
+            with open(path, newline="", encoding="utf-8") as existing_file:
+                reader = csv.reader(existing_file)
+                fieldnames = next(reader, [])
+            new_fields = sorted({k for row in rows for k in row.keys() if k not in fieldnames})
+            if new_fields:
+                existing_rows = read_csv_dicts(path)
+                fieldnames = fieldnames + new_fields
+                with open(path, "w", newline="", encoding="utf-8") as rewrite_file:
+                    writer = csv.DictWriter(rewrite_file, fieldnames=fieldnames, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(existing_rows)
+        else:
+            fieldnames = sorted({k for row in rows for k in row.keys()})
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if not exists:
                 writer.writeheader()
-                writer.writerows(existing_rows)
-    else:
-        fieldnames = sorted({k for row in rows for k in row.keys()})
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if not exists:
-            writer.writeheader()
-        writer.writerows(rows)
+            writer.writerows(rows)
+
+
+def append_jsonl_text(path: str, text: str) -> None:
+    with IO_LOCK:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text.rstrip("\r\n"))
+            f.write("\n")
 
 
 def read_csv_dicts(path: str) -> list[dict[str, str]]:
     if not os.path.exists(path):
         return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    with IO_LOCK:
+        with open(path, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
 
 
 def read_trades(path: str) -> list[PaperTrade]:
@@ -1296,6 +1370,7 @@ def read_trades(path: str) -> list[PaperTrade]:
                 "exit_proceeds_usdc",
                 "monitor_last_yes_price",
                 "monitor_price_trigger",
+                "monitor_peak_pnl_usdc",
                 "payout_usdc",
                 "pnl_usdc",
             }:
@@ -1319,6 +1394,7 @@ def read_trades(path: str) -> list[PaperTrade]:
             "exit_fee_usdc",
             "exit_proceeds_usdc",
             "monitor_price_trigger",
+            "monitor_peak_pnl_usdc",
             "payout_usdc",
             "pnl_usdc",
         }:
@@ -1330,10 +1406,11 @@ def read_trades(path: str) -> list[PaperTrade]:
 def write_csv(path: str, rows: Iterable[Any]) -> None:
     materialized = [asdict(r) if hasattr(r, "__dataclass_fields__") else dict(r) for r in rows]
     fieldnames = sorted({k for row in materialized for k in row.keys()})
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(materialized)
+    with IO_LOCK:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(materialized)
 
 
 def pct(numerator: float, denominator: float) -> float:
@@ -1583,6 +1660,78 @@ def process_strategy4_reprice(config: dict[str, Any]) -> list[PaperTrade]:
     return process_strategy4_reprice_on_trigger(config, force=False)
 
 
+def strategy4_exit_metrics(
+    config: dict[str, Any],
+    trade: PaperTrade,
+    current_choice: TemperatureMarket,
+) -> dict[str, Any]:
+    raw_current_market = parse_jsonish(current_choice.raw_market_json, {})
+    mark_yes = float(current_choice.yes_price or 0.0)
+    sell_yes = mark_yes
+    yes_best_bid = None
+    yes_best_ask = None
+    if isinstance(raw_current_market, dict):
+        try:
+            yes_best_bid = float(raw_current_market["bestBid"]) if raw_current_market.get("bestBid") not in {"", None} else None
+        except (TypeError, ValueError):
+            yes_best_bid = None
+        try:
+            yes_best_ask = float(raw_current_market["bestAsk"]) if raw_current_market.get("bestAsk") not in {"", None} else None
+        except (TypeError, ValueError):
+            yes_best_ask = None
+    if yes_best_bid is not None and yes_best_bid > 0:
+        sell_yes = yes_best_bid
+    current_no = outcome_price(raw_current_market, "No") if isinstance(raw_current_market, dict) else None
+    fee_enabled = bool(config["trading"]["fee_enabled"])
+    fee_rate = float(trade.taker_fee_rate)
+    sell_fee = taker_fee_usdc(trade.shares, sell_yes, fee_rate, fee_enabled)
+    sell_proceeds = trade.shares * sell_yes - sell_fee
+    sell_pnl = sell_proceeds - trade.total_cost_usdc
+    hedge_pnl = -999999.0
+    hedge_proceeds = 0.0
+    hedge_fee = 0.0
+    if current_no is not None and current_no > 0:
+        hedge_fee = taker_fee_usdc(trade.shares, float(current_no), fee_rate, fee_enabled)
+        no_cost = trade.shares * float(current_no) + hedge_fee
+        hedge_proceeds = trade.shares - no_cost
+        hedge_pnl = hedge_proceeds - trade.total_cost_usdc
+    use_hedge = current_no is not None and hedge_pnl > sell_pnl
+    return {
+        "current_yes": sell_yes,
+        "mark_yes": mark_yes,
+        "yes_best_bid": yes_best_bid,
+        "yes_best_ask": yes_best_ask,
+        "current_no": current_no,
+        "sell_fee": sell_fee,
+        "sell_proceeds": sell_proceeds,
+        "sell_pnl": sell_pnl,
+        "hedge_fee": hedge_fee,
+        "hedge_proceeds": hedge_proceeds,
+        "hedge_pnl": hedge_pnl,
+        "use_hedge": use_hedge,
+        "best_pnl": hedge_pnl if use_hedge else sell_pnl,
+    }
+
+
+def apply_strategy4_exit(
+    trade: PaperTrade,
+    *,
+    now_text: str,
+    exit_reason: str,
+    metrics: dict[str, Any],
+    use_hedge: bool,
+) -> str:
+    trade.status = "SOLD"
+    trade.exit_at = now_text
+    trade.exit_reason = exit_reason
+    trade.exit_yes_price = float(metrics["current_yes"])
+    trade.exit_fee_usdc = round(float(metrics["hedge_fee"] if use_hedge else metrics["sell_fee"]), 8)
+    trade.exit_proceeds_usdc = round(float(metrics["hedge_proceeds"] if use_hedge else metrics["sell_proceeds"]), 8)
+    trade.payout_usdc = trade.exit_proceeds_usdc
+    trade.pnl_usdc = round(float(metrics["hedge_pnl"] if use_hedge else metrics["sell_pnl"]), 8)
+    return "buy_no_hedge" if use_hedge else "sell_yes"
+
+
 def process_strategy4_reprice_on_trigger(
     config: dict[str, Any],
     *,
@@ -1608,13 +1757,36 @@ def process_strategy4_reprice_on_trigger(
     cycle_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f":{strategy_name}:monitor"
     max_buy_yes_price = float(strategy_config["trading"].get("max_buy_yes_price", 0.5))
     trigger_default = float(strategy_config["trading"].get("monitor_price_change_trigger", 0.05))
+    stop_loss_fraction = float(strategy_config["trading"].get("stop_loss_fraction_of_cost", 0.25))
+    profit_drawdown_fraction = float(strategy_config["trading"].get("profit_drawdown_fraction", 0.3))
+    profit_drawdown_min_profit = float(strategy_config["trading"].get("profit_drawdown_min_profit_usdc", 1.0))
     trigger_context = trigger_context or {}
     changed_count = 0
     new_trades: list[PaperTrade] = []
     twc_wide_rows: list[dict[str, Any]] = []
+    target_city = str(trigger_context.get("city") or "")
+    target_kind = str(trigger_context.get("kind") or "")
+    target_event_date = str(trigger_context.get("event_date") or "")
+    allowed_cities = {
+        str(city)
+        for city in (
+            strategy_config["trading"].get("allowed_cities")
+            or config["events"].get("allowed_cities")
+            or []
+        )
+        if str(city)
+    }
 
     for trade in trades:
         if trade.status != "OPEN" or trade.strategy != strategy_name:
+            continue
+        if allowed_cities and trade.city not in allowed_cities:
+            continue
+        if force and target_city and trade.city != target_city:
+            continue
+        if force and target_kind and trade.kind != target_kind:
+            continue
+        if force and target_event_date and trade.event_date != target_event_date:
             continue
         try:
             event = fetch_event_by_trade(strategy_config, trade)
@@ -1628,6 +1800,7 @@ def process_strategy4_reprice_on_trigger(
                 continue
 
             current_yes = float(current_choice.yes_price)
+            metrics = strategy4_exit_metrics(strategy_config, trade, current_choice)
             baseline = float(trade.monitor_last_yes_price if trade.monitor_last_yes_price is not None else trade.yes_price or current_yes)
             trigger = float(trade.monitor_price_trigger or trigger_default)
             delta = round(current_yes - baseline, 8)
@@ -1680,47 +1853,103 @@ def process_strategy4_reprice_on_trigger(
             twc_wide_rows.extend(wide_rows)
             latest_id = latest_choice.market_id if latest_choice else ""
             if latest_choice and latest_choice.market_id == trade.market_id:
+                previous_peak = max(
+                    float(trade.monitor_peak_pnl_usdc or 0.0),
+                    float(STRATEGY4_PEAK_PNL_BY_TRADE.get(trade.trade_id, 0.0)),
+                )
+                best_pnl = float(metrics["best_pnl"])
+                peak_pnl = previous_peak
+                trade.monitor_peak_pnl_usdc = round(peak_pnl, 8)
+                sell_pnl = float(metrics["sell_pnl"])
+                stop_loss_amount = trade.total_cost_usdc * stop_loss_fraction
+                drawdown = peak_pnl - best_pnl
+                drawdown_threshold = peak_pnl * profit_drawdown_fraction
+                if stop_loss_fraction > 0 and sell_pnl <= -stop_loss_amount:
+                    action = apply_strategy4_exit(
+                        trade,
+                        now_text=now_text,
+                        exit_reason=f"strategy4_stop_loss_forecast_same_loss_fraction_{stop_loss_fraction:g}",
+                        metrics=metrics,
+                        use_hedge=False,
+                    )
+                    changed_count += 1
+                    LOGGER.info(
+                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=stop_loss action=%s current_yes=%s current_no=%s sell_pnl=%s stop_loss_amount=%s peak_pnl=%s exit_fee=%s proceeds=%s pnl=%s",
+                        trade.trade_id,
+                        trade.city,
+                        trade.kind,
+                        trade.market_id,
+                        action,
+                        current_yes,
+                        metrics["current_no"] if metrics["current_no"] is not None else "",
+                        round(sell_pnl, 8),
+                        round(stop_loss_amount, 8),
+                        round(peak_pnl, 8),
+                        trade.exit_fee_usdc,
+                        trade.exit_proceeds_usdc,
+                        trade.pnl_usdc,
+                    )
+                    continue
+                if (
+                    profit_drawdown_fraction > 0
+                    and peak_pnl >= profit_drawdown_min_profit
+                    and drawdown >= drawdown_threshold
+                ):
+                    use_hedge = bool(metrics["use_hedge"])
+                    action = apply_strategy4_exit(
+                        trade,
+                        now_text=now_text,
+                        exit_reason=f"strategy4_profit_drawdown_forecast_same_fraction_{profit_drawdown_fraction:g}",
+                        metrics=metrics,
+                        use_hedge=use_hedge,
+                    )
+                    changed_count += 1
+                    LOGGER.info(
+                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=profit_drawdown action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s peak_pnl=%s drawdown=%s threshold=%s exit_fee=%s proceeds=%s pnl=%s",
+                        trade.trade_id,
+                        trade.city,
+                        trade.kind,
+                        trade.market_id,
+                        action,
+                        current_yes,
+                        metrics["current_no"] if metrics["current_no"] is not None else "",
+                        round(float(metrics["sell_pnl"]), 8),
+                        round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
+                        round(best_pnl, 8),
+                        round(peak_pnl, 8),
+                        round(drawdown, 8),
+                        round(drawdown_threshold, 8),
+                        trade.exit_fee_usdc,
+                        trade.exit_proceeds_usdc,
+                        trade.pnl_usdc,
+                    )
+                    continue
                 trade.monitor_last_yes_price = current_yes
                 LOGGER.info(
-                    "strategy4 monitor repriced_but_forecast_same trade=%s city=%s kind=%s market=%s current_yes=%s delta=%s latest_forecast=%s%s",
+                    "strategy4 monitor repriced_but_forecast_same trade=%s city=%s kind=%s market=%s current_yes=%s current_no=%s delta=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s peak_pnl=%s latest_forecast=%s%s",
                     trade.trade_id,
                     trade.city,
                     trade.kind,
                     trade.market_id,
                     current_yes,
+                    metrics["current_no"] if metrics["current_no"] is not None else "",
                     delta,
+                    round(float(metrics["sell_pnl"]), 8),
+                    round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
+                    round(best_pnl, 8),
+                    round(peak_pnl, 8),
                     forecast_meta.get("forecast_high") if trade.kind == "Highest" else forecast_meta.get("forecast_low"),
                     forecast_meta.get("forecast_unit", ""),
                 )
                 continue
 
-            raw_current_market = parse_jsonish(current_choice.raw_market_json, {})
-            current_no = outcome_price(raw_current_market, "No") if isinstance(raw_current_market, dict) else None
-            sell_fee = taker_fee_usdc(trade.shares, current_yes, float(trade.taker_fee_rate), bool(strategy_config["trading"]["fee_enabled"]))
-            sell_proceeds = trade.shares * current_yes - sell_fee
-            sell_pnl = sell_proceeds - trade.total_cost_usdc
-            hedge_pnl = -999999.0
-            hedge_proceeds = 0.0
-            hedge_fee = 0.0
-            if current_no is not None and current_no > 0:
-                hedge_fee = taker_fee_usdc(trade.shares, float(current_no), float(trade.taker_fee_rate), bool(strategy_config["trading"]["fee_enabled"]))
-                no_cost = trade.shares * float(current_no) + hedge_fee
-                hedge_proceeds = trade.shares - no_cost
-                hedge_pnl = hedge_proceeds - trade.total_cost_usdc
-
-            use_hedge = current_no is not None and hedge_pnl > sell_pnl
-            trade.status = "SOLD"
-            trade.exit_at = now_text
-            trade.exit_reason = (
+            use_hedge = bool(metrics["use_hedge"])
+            exit_reason = (
                 f"strategy4_forecast_changed_buy_no_hedge_new_market_{latest_id}"
                 if use_hedge
                 else f"strategy4_forecast_changed_sell_yes_new_market_{latest_id}"
             )
-            trade.exit_yes_price = current_yes
-            trade.exit_fee_usdc = round(hedge_fee if use_hedge else sell_fee, 8)
-            trade.exit_proceeds_usdc = round(hedge_proceeds if use_hedge else sell_proceeds, 8)
-            trade.payout_usdc = trade.exit_proceeds_usdc
-            trade.pnl_usdc = round((hedge_pnl if use_hedge else sell_pnl), 8)
+            action = apply_strategy4_exit(trade, now_text=now_text, exit_reason=exit_reason, metrics=metrics, use_hedge=use_hedge)
             changed_count += 1
             LOGGER.info(
                 "strategy4 exit trade=%s city=%s kind=%s old_market=%s latest_market=%s current_yes=%s current_no=%s delta=%s action=%s sell_pnl=%s hedge_pnl=%s exit_fee=%s proceeds=%s pnl=%s",
@@ -1730,11 +1959,11 @@ def process_strategy4_reprice_on_trigger(
                 trade.market_id,
                 latest_id,
                 current_yes,
-                current_no if current_no is not None else "",
+                metrics["current_no"] if metrics["current_no"] is not None else "",
                 delta,
-                "buy_no_hedge" if use_hedge else "sell_yes",
-                round(sell_pnl, 8),
-                round(hedge_pnl, 8) if current_no is not None else "",
+                action,
+                round(float(metrics["sell_pnl"]), 8),
+                round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
                 trade.exit_fee_usdc,
                 trade.exit_proceeds_usdc,
                 trade.pnl_usdc,
@@ -1822,10 +2051,20 @@ def strategy4_open_trades(config: dict[str, Any]) -> tuple[dict[str, Any], list[
     if not strategy_config:
         return {}, []
     strategy_name = str(strategy_config["trading"]["strategy_name"])
+    allowed_cities = {
+        str(city)
+        for city in (
+            strategy_config["trading"].get("allowed_cities")
+            or config["events"].get("allowed_cities")
+            or []
+        )
+        if str(city)
+    }
     trades = [
         trade
         for trade in read_trades(config["outputs"]["trades_csv"])
         if trade.status == "OPEN" and trade.strategy == strategy_name
+        and (not allowed_cities or trade.city in allowed_cities)
     ]
     return strategy_config, trades
 
@@ -1835,12 +2074,12 @@ def strategy4_websocket_assets(config: dict[str, Any]) -> tuple[dict[str, Any], 
     if not strategy_config or not trades:
         return strategy_config, {}
     assets: dict[str, dict[str, Any]] = {}
-    seen_events: set[str] = set()
+    trades_by_event: dict[str, PaperTrade] = {}
     for trade in trades:
         event_key = f"{trade.event_date}|{trade.city}|{trade.kind}|{trade.polymarket_url}"
-        if event_key in seen_events:
+        if event_key in trades_by_event:
             continue
-        seen_events.add(event_key)
+        trades_by_event[event_key] = trade
         event = fetch_event_by_trade(strategy_config, trade)
         if not event:
             continue
@@ -1861,6 +2100,7 @@ def strategy4_websocket_assets(config: dict[str, Any]) -> tuple[dict[str, Any], 
                         baseline = float(outcome_prices[idx])
                     except (TypeError, ValueError):
                         baseline = None
+                is_holding_yes = market.market_id == trade.market_id and str(outcome).lower() == "yes"
                 assets[asset_id] = {
                     "asset_id": asset_id,
                     "baseline": baseline,
@@ -1873,6 +2113,10 @@ def strategy4_websocket_assets(config: dict[str, Any]) -> tuple[dict[str, Any], 
                     "market_id": market.market_id,
                     "market_question": market.market_question,
                     "polymarket_url": trade.polymarket_url,
+                    "holding_trade_id": trade.trade_id if is_holding_yes else "",
+                    "holding_shares": trade.shares if is_holding_yes else "",
+                    "holding_total_cost_usdc": trade.total_cost_usdc if is_holding_yes else "",
+                    "holding_peak_pnl_usdc": trade.monitor_peak_pnl_usdc if is_holding_yes else "",
                 }
     return strategy_config, assets
 
@@ -1904,10 +2148,61 @@ def websocket_message_prices(message: Any) -> list[tuple[str, float, str]]:
     return rows
 
 
+def update_strategy4_websocket_peak(
+    config: dict[str, Any],
+    strategy_config: dict[str, Any],
+    asset: dict[str, Any],
+    price: float,
+    price_field: str,
+) -> None:
+    trade_id = str(asset.get("holding_trade_id") or "")
+    if not trade_id:
+        return
+    allowed_fields = {
+        str(v)
+        for v in strategy_config["trading"].get(
+            "websocket_peak_price_fields",
+            ["price", "best_bid", "bid", "last_trade_price"],
+        )
+    }
+    if price_field not in allowed_fields or price <= 0:
+        return
+    try:
+        shares = float(asset.get("holding_shares") or 0.0)
+        total_cost = float(asset.get("holding_total_cost_usdc") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if shares <= 0 or total_cost <= 0:
+        return
+    fee_rate = float(strategy_config["trading"].get("fee_rate", config["trading"].get("fee_rate", 0.05)))
+    fee = taker_fee_usdc(shares, price, fee_rate, bool(strategy_config["trading"]["fee_enabled"]))
+    pnl = shares * price - fee - total_cost
+    previous_peak = max(
+        float(STRATEGY4_PEAK_PNL_BY_TRADE.get(trade_id, 0.0)),
+        float(asset.get("holding_peak_pnl_usdc") or 0.0),
+    )
+    if pnl > previous_peak:
+        new_peak = round(pnl, 8)
+        STRATEGY4_PEAK_PNL_BY_TRADE[trade_id] = new_peak
+        asset["holding_peak_pnl_usdc"] = new_peak
+        LOGGER.info(
+            "strategy4 websocket peak_update trade=%s city=%s kind=%s market=%s price_field=%s price=%s pnl=%s previous_peak=%s new_peak=%s",
+            trade_id,
+            asset.get("city", ""),
+            asset.get("kind", ""),
+            asset.get("market_id", ""),
+            price_field,
+            price,
+            round(pnl, 8),
+            round(previous_peak, 8),
+            new_peak,
+        )
+
+
 def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -> bool:
     strategy_config, assets = strategy4_websocket_assets(config)
     if not strategy_config or not assets:
-        time.sleep(duration_seconds)
+        time.sleep(max(1, min(duration_seconds or 10, 10)))
         return False
     if not strategy_config["trading"].get("websocket_enabled", True):
         time.sleep(duration_seconds)
@@ -1924,38 +2219,57 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
     ping_seconds = int(strategy_config["trading"].get("websocket_ping_seconds", 10))
     trigger_default = float(strategy_config["trading"].get("monitor_price_change_trigger", 0.05))
     asset_ids = sorted(assets)
-    deadline = time.monotonic() + max(1, duration_seconds)
+    persistent = bool(strategy_config["trading"].get("websocket_persistent", True))
+    deadline = None if persistent else time.monotonic() + max(1, duration_seconds)
     next_ping = time.monotonic() + max(1, ping_seconds)
-    LOGGER.info("strategy4 websocket connect assets=%s events=%s duration=%ss", len(asset_ids), len({a["polymarket_url"] for a in assets.values()}), duration_seconds)
+    websocket_raw_jsonl = str(
+        config["outputs"].get(
+            "polymarket_websocket_raw_jsonl",
+            config["outputs"].get("polymarket_websocket_raw_csv", "polymarket_weather_websocket_raw.jsonl"),
+        )
+    )
+    LOGGER.info(
+        "strategy4 websocket connect assets=%s events=%s persistent=%s duration=%ss",
+        len(asset_ids),
+        len({a["polymarket_url"] for a in assets.values()}),
+        persistent,
+        duration_seconds,
+    )
 
     ws = None
     try:
         ws = websocket.create_connection(ws_url, timeout=timeout_seconds)
         ws.send(json.dumps({"type": "market", "assets_ids": asset_ids, "asset_ids": asset_ids, "custom_feature_enabled": True}))
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             if time.monotonic() >= next_ping:
                 ws.send("PING")
                 next_ping = time.monotonic() + max(1, ping_seconds)
-            ws.settimeout(max(1, min(timeout_seconds, int(deadline - time.monotonic()) or 1)))
+            if deadline is None:
+                ws.settimeout(max(1, timeout_seconds))
+            else:
+                ws.settimeout(max(1, min(timeout_seconds, int(deadline - time.monotonic()) or 1)))
             try:
                 raw_message = ws.recv()
             except (socket.timeout, TimeoutError):
                 continue
             if raw_message in {"", "PONG", "PING"}:
                 continue
+            raw_text = raw_message.decode("utf-8", errors="replace") if isinstance(raw_message, bytes) else str(raw_message)
+            append_jsonl_text(websocket_raw_jsonl, raw_text)
             try:
-                message = json.loads(raw_message)
+                message = json.loads(raw_text)
             except (TypeError, ValueError):
                 continue
             for asset_id, price, price_field in websocket_message_prices(message):
                 if asset_id not in assets:
                     continue
                 asset = assets[asset_id]
+                update_strategy4_websocket_peak(config, strategy_config, asset, price, price_field)
                 baseline = asset.get("last_price")
+                delta = None if baseline is None else round(price - float(baseline), 8)
                 if baseline is None:
                     asset["last_price"] = price
                     continue
-                delta = round(price - float(baseline), 8)
                 asset["last_price"] = price
                 trigger = trigger_default
                 if abs(delta) < trigger:
@@ -1978,11 +2292,21 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
                 }
                 LOGGER.info("strategy4 websocket trigger %s", json.dumps(context, ensure_ascii=False, sort_keys=True))
                 process_strategy4_reprice_on_trigger(config, force=True, trigger_context=context)
-                return True
+                strategy_config, refreshed_assets = strategy4_websocket_assets(config)
+                refreshed_ids = sorted(refreshed_assets)
+                if refreshed_ids and refreshed_ids != asset_ids:
+                    assets = refreshed_assets
+                    asset_ids = refreshed_ids
+                    ws.send(json.dumps({"type": "market", "assets_ids": asset_ids, "asset_ids": asset_ids, "custom_feature_enabled": True}))
+                    LOGGER.info(
+                        "strategy4 websocket resubscribe assets=%s events=%s",
+                        len(asset_ids),
+                        len({a["polymarket_url"] for a in assets.values()}),
+                    )
     except Exception:
         LOGGER.exception("strategy4 websocket monitor failed; falling back to normal sleep")
-        remaining = max(0, int(deadline - time.monotonic()))
-        if remaining:
+        remaining = 0 if deadline is None else max(0, int(deadline - time.monotonic()))
+        if remaining and not persistent:
             time.sleep(remaining)
         return False
     finally:
@@ -1992,6 +2316,35 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
             except Exception:
                 pass
     return False
+
+
+def strategy4_websocket_supervisor(config: dict[str, Any]) -> None:
+    strategy_config = next(
+        (
+            strategy_config
+            for strategy_config in active_strategy_configs(config)
+            if strategy_config["trading"].get("strategy_mode") == "twc_reprice_momentum"
+        ),
+        {},
+    )
+    if not strategy_config or not strategy_config["trading"].get("websocket_enabled", True):
+        return
+    reconnect_seconds = int(strategy_config["trading"].get("websocket_reconnect_seconds", 5))
+    LOGGER.info("strategy4 websocket supervisor started")
+    while True:
+        monitor_strategy4_websocket(config, 0)
+        time.sleep(max(1, reconnect_seconds))
+
+
+def start_strategy4_websocket_thread(config: dict[str, Any]) -> threading.Thread:
+    thread = threading.Thread(
+        target=strategy4_websocket_supervisor,
+        args=(config,),
+        name="strategy4-websocket",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def all_events_settled(events: list[dict[str, Any]]) -> bool:
@@ -2013,6 +2366,19 @@ def price_snapshot_due(config: dict[str, Any], now: datetime, last_run_at: Optio
     return False, f"only_elapsed_{elapsed}s"
 
 
+def twc_raw_collection_due(config: dict[str, Any], now: datetime, last_run_at: Optional[datetime]) -> tuple[bool, str]:
+    collector_config = config.get("twc_raw_collection", {})
+    if not collector_config.get("enabled", False):
+        return False, "disabled"
+    interval = int(collector_config.get("run_every_minutes", 15)) * 60
+    if last_run_at is None:
+        return True, "first_run"
+    elapsed = int((now - last_run_at).total_seconds())
+    if elapsed >= interval:
+        return True, f"elapsed_{elapsed}s"
+    return False, f"only_elapsed_{elapsed}s"
+
+
 def price_snapshot_window_status(config: dict[str, Any], kind: str, local_dt: Optional[datetime]) -> tuple[bool, str, str]:
     snapshot_config = config.get("polymarket_price_snapshots", {})
     if not snapshot_config.get("time_windows_enabled", True):
@@ -2026,6 +2392,21 @@ def price_snapshot_window_status(config: dict[str, Any], kind: str, local_dt: Op
     window = parse_hour_window(window_text)
     allowed = hour_in_window(local_dt.hour, window)
     return allowed, window_text, "inside_local_window" if allowed else f"outside_local_window_{window_text}"
+
+
+def twc_raw_collection_window_status(config: dict[str, Any], kind: str, local_dt: Optional[datetime]) -> tuple[bool, str, str]:
+    collector_config = config.get("twc_raw_collection", {})
+    if not collector_config.get("time_windows_enabled", True):
+        return True, "", "time_windows_disabled"
+    if local_dt is None:
+        return False, "", "missing_city_timezone"
+    if kind == "Lowest":
+        window_text = str(collector_config.get("lowest_local_hour_window", "0-6"))
+    else:
+        window_text = str(collector_config.get("highest_local_hour_window", "12-18"))
+    window = parse_hour_window(window_text)
+    allowed = hour_in_window(local_dt.hour, window)
+    return allowed, window_text, "inside_twc_raw_collection_window" if allowed else f"outside_twc_raw_collection_window_{window_text}"
 
 
 def market_price_snapshot_rows(
@@ -2114,6 +2495,122 @@ def collect_polymarket_price_snapshots(config: dict[str, Any], cycle_id: str) ->
             time.sleep(float(config["api"]["per_request_delay_seconds"]))
     append_csv(str(config["outputs"].get("polymarket_price_snapshots_csv", "polymarket_weather_price_snapshots.csv")), rows)
     LOGGER.info("[%s] price_snapshot rows=%s", cycle_id, len(rows))
+    return len(rows)
+
+
+def collect_twc_raw_snapshots(config: dict[str, Any], cycle_id: str) -> int:
+    collector_config = config.get("twc_raw_collection", {})
+    if not collector_config.get("enabled", False):
+        return 0
+    raw_dates = collector_config.get("target_dates") or config["events"]["target_dates"]
+    target_dates = [resolve_date(str(v)) for v in raw_dates]
+    strategy_name = str(collector_config.get("strategy_name", "twc_raw_collector"))
+    rows: list[dict[str, Any]] = []
+    for target in target_dates:
+        events = discover_temperature_events(config, target)
+        LOGGER.info("[%s] twc_raw_collection target=%s events=%s", cycle_id, target.isoformat(), len(events))
+        for event in events:
+            city = event.get("_parsed_city", "")
+            kind = event.get("_parsed_kind", "")
+            event_url = poly_url_from_event(event)
+            city_local_dt, city_timezone, _ = city_local_now(config, city)
+            allowed, window_text, reason = twc_raw_collection_window_status(config, kind, city_local_dt)
+            if not allowed:
+                LOGGER.info(
+                    "[%s] twc_raw_collection skip city=%s kind=%s reason=%s local_time=%s timezone=%s",
+                    cycle_id,
+                    city,
+                    kind,
+                    reason,
+                    city_local_dt.isoformat() if city_local_dt else "",
+                    city_timezone,
+                )
+                continue
+            station = ""
+            wu_source = ""
+            event_unit = ""
+            twc_units = ""
+            try:
+                markets = markets_for_event(config, event)
+                event_unit = event_market_unit(markets)
+                twc_units = twc_units_for_temperature_unit(event_unit)
+                wu_source = extract_wunderground_source(config, event_url)
+                station = station_from_wu_url(wu_source)
+                if not station:
+                    raise RuntimeError("No ICAO station code found in Wunderground source URL.")
+
+                payload = twc_hourly_forecast_by_icao(config, station, units=twc_units)
+                horizon_hours = int(collector_config.get("forecast_horizon_hours", 6))
+                if collector_config.get("forecast_scope") == "event_day_full":
+                    forecast_points = daily_twc_points(payload, event["_parsed_event_date"])
+                else:
+                    forecast_points = filtered_twc_points(payload, event["_parsed_event_date"], horizon_hours)
+                historical_payload: dict[str, Any] = {}
+                observed_points: list[tuple[datetime, float]] = []
+                if collector_config.get("include_observed_today", True) and target <= date.today():
+                    historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
+                    observed_points = observed_twc_points(historical_payload, event["_parsed_event_date"], city_local_dt)
+                combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
+                rows.append(
+                    twc_raw_wide_row(
+                        cycle_id=cycle_id,
+                        strategy_name=strategy_name,
+                        target_date=target,
+                        city=city,
+                        kind=kind,
+                        station=station,
+                        event_unit=event_unit,
+                        twc_units=twc_units,
+                        city_local_dt=city_local_dt,
+                        city_timezone=city_timezone,
+                        observed_points=observed_points,
+                        forecast_points=forecast_points,
+                        combined_points=combined_points,
+                        forecast_payload=payload,
+                        historical_payload=historical_payload,
+                        event_url=event_url,
+                        wunderground_source_url=wu_source,
+                    )
+                )
+                LOGGER.info(
+                    "[%s] twc_raw_collection city=%s kind=%s station=%s unit=%s window=%s observed=%s forecast=%s combined=%s",
+                    cycle_id,
+                    city,
+                    kind,
+                    station,
+                    twc_forecast_unit_for_units(twc_units),
+                    window_text,
+                    len(observed_points),
+                    len(forecast_points),
+                    len(combined_points),
+                )
+            except Exception as exc:
+                LOGGER.exception("[%s] twc_raw_collection failed city=%s kind=%s url=%s", cycle_id, city, kind, event_url)
+                rows.append(
+                    twc_raw_wide_row(
+                        cycle_id=cycle_id,
+                        strategy_name=strategy_name,
+                        target_date=target,
+                        city=city,
+                        kind=kind,
+                        station=station,
+                        event_unit=event_unit,
+                        twc_units=twc_units,
+                        city_local_dt=city_local_dt,
+                        city_timezone=city_timezone,
+                        observed_points=[],
+                        forecast_points=[],
+                        combined_points=[],
+                        forecast_payload={},
+                        historical_payload={},
+                        event_url=event_url,
+                        wunderground_source_url=wu_source,
+                        error=repr(exc),
+                    )
+                )
+            time.sleep(float(config["api"]["per_request_delay_seconds"]))
+    append_twc_raw_wide(config, rows)
+    LOGGER.info("[%s] twc_raw_collection rows=%s", cycle_id, len(rows))
     return len(rows)
 
 
@@ -2428,28 +2925,6 @@ def run_strategy4_cycle(config: dict[str, Any], cycle_id: str) -> int:
                     )
                     continue
 
-                event_key = (event["_parsed_event_date"], city, kind)
-                if event_key in open_event_keys:
-                    snapshot_rows.append(
-                        snapshot_row_for_strategy4(
-                            config=config,
-                            cycle_id=cycle_id,
-                            strategy_name=strategy_name,
-                            target=target,
-                            event=event,
-                            event_url=event_url,
-                            city_local_dt=city_local_dt,
-                            city_timezone=city_timezone,
-                            city_time_source=city_time_source,
-                            window_text=window_text,
-                            window_allowed=True,
-                            window_reason="open_position_exists",
-                            event_unit=event_unit,
-                        )
-                    )
-                    LOGGER.info("[%s] skip strategy=%s city=%s kind=%s reason=open_position_exists", cycle_id, strategy_name, city, kind)
-                    continue
-
                 wu_source = extract_wunderground_source(config, event_url)
                 station = station_from_wu_url(wu_source)
                 if not station:
@@ -2469,6 +2944,10 @@ def run_strategy4_cycle(config: dict[str, Any], cycle_id: str) -> int:
                 )
                 twc_wide_rows.extend(wide_rows)
                 should_buy = bool(chosen and chosen.yes_price is not None and chosen.yes_price > 0 and chosen.yes_price <= max_buy_yes_price)
+                event_key = (event["_parsed_event_date"], city, kind)
+                already_open = event_key in open_event_keys
+                if already_open:
+                    should_buy = False
                 snapshot_rows.append(
                     snapshot_row_for_strategy4(
                         config=config,
@@ -2490,9 +2969,31 @@ def run_strategy4_cycle(config: dict[str, Any], cycle_id: str) -> int:
                         forecast_meta=forecast_meta,
                         max_buy_yes_price=max_buy_yes_price,
                         should_buy=should_buy,
-                        error="" if should_buy else ("price_above_max_buy_or_no_usable_market" if chosen else "no_usable_market"),
+                        error=(
+                            ""
+                            if should_buy
+                            else (
+                                "open_position_exists_twc_recorded"
+                                if already_open
+                                else ("price_above_max_buy_or_no_usable_market" if chosen else "no_usable_market")
+                            )
+                        ),
                     )
                 )
+                if already_open:
+                    LOGGER.info(
+                        "[%s] skip_buy strategy=%s city=%s kind=%s station=%s forecast=%s%s market=%s price=%s reason=open_position_exists_twc_recorded",
+                        cycle_id,
+                        strategy_name,
+                        city,
+                        kind,
+                        station,
+                        forecast_meta.get("forecast_high") if kind == "Highest" else forecast_meta.get("forecast_low"),
+                        event_unit,
+                        chosen.market_id if chosen else "",
+                        chosen.yes_price if chosen else "",
+                    )
+                    continue
                 if not should_buy or not chosen:
                     LOGGER.info(
                         "[%s] skip strategy=%s city=%s kind=%s station=%s forecast=%s%s market=%s price=%s max_buy=%s reason=%s",
@@ -3418,6 +3919,8 @@ def loop_sleep_seconds(config: dict[str, Any]) -> int:
     intervals = [int(config["scheduler"]["poll_interval_minutes"]) * 60]
     if config.get("polymarket_price_snapshots", {}).get("enabled", False):
         intervals.append(int(config["polymarket_price_snapshots"].get("run_every_minutes", 1)) * 60)
+    if config.get("twc_raw_collection", {}).get("enabled", False):
+        intervals.append(int(config["twc_raw_collection"].get("run_every_minutes", 15)) * 60)
     for strategy in config.get("strategies") or []:
         if strategy.get("enabled", True):
             intervals.append(int(strategy.get("run_every_minutes", config["scheduler"]["poll_interval_minutes"])) * 60)
@@ -3435,6 +3938,8 @@ def write_state(config: dict[str, Any], cycle_num: int) -> None:
         "performance_by_cycle_csv": config["outputs"]["performance_by_cycle_csv"],
         "performance_by_event_csv": config["outputs"]["performance_by_event_csv"],
         "twc_raw_wide_csv": config["outputs"].get("twc_raw_wide_csv", "polymarket_weather_twc_raw_wide.csv"),
+        "twc_raw_collection_enabled": bool(config.get("twc_raw_collection", {}).get("enabled", False)),
+        "twc_raw_collection_run_every_minutes": int(config.get("twc_raw_collection", {}).get("run_every_minutes", 15)),
         "polymarket_price_snapshots_csv": config["outputs"].get("polymarket_price_snapshots_csv", "polymarket_weather_price_snapshots.csv"),
         "log_file": config["outputs"]["log_file"],
     }
@@ -3464,21 +3969,12 @@ def summarize_settled(config: dict[str, Any]) -> None:
 def run(config: dict[str, Any]) -> None:
     cycle_num = 0
     last_run_at: dict[str, datetime] = {}
-    last_price_snapshot_at: Optional[datetime] = None
     max_cycles = int(config["scheduler"]["max_cycles"])
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
+    start_strategy4_websocket_thread(config)
     while True:
         cycle_num += 1
-        now = datetime.now()
-        base_cycle_id = now.strftime("%Y%m%dT%H%M%S") + f"-{cycle_num}"
         run_cycle(config, cycle_num, last_run_at)
-        due, reason = price_snapshot_due(config, datetime.now(), last_price_snapshot_at)
-        if due:
-            collect_polymarket_price_snapshots(config, f"{base_cycle_id}:price_snapshot")
-            last_price_snapshot_at = datetime.now()
-        else:
-            LOGGER.info("[%s] price_snapshot not due reason=%s", base_cycle_id, reason)
-        process_strategy_exits(config)
         process_strategy4_reprice(config)
         if config["scheduler"]["settle_after_each_cycle"]:
             settle_open_trades(config)
@@ -3500,7 +3996,7 @@ def run(config: dict[str, Any]) -> None:
         else:
             sleep_seconds = loop_sleep_seconds(config)
         log_info(f"sleeping {sleep_seconds} seconds")
-        monitor_strategy4_websocket(config, sleep_seconds)
+        time.sleep(sleep_seconds)
 
 
 def build_parser() -> argparse.ArgumentParser:
