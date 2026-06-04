@@ -125,8 +125,11 @@ class PaperTrade:
     total_cost_usdc: float
     exit_at: str = ""
     exit_reason: str = ""
+    exit_action: str = ""
     exit_yes_price: Optional[float] = None
+    exit_no_price: Optional[float] = None
     exit_fee_usdc: float = 0.0
+    exit_hedge_cost_usdc: float = 0.0
     exit_proceeds_usdc: float = 0.0
     monitor_last_yes_price: Optional[float] = None
     monitor_last_checked_at: str = ""
@@ -350,7 +353,7 @@ def default_config() -> dict[str, Any]:
                     "stop_loss_fraction_of_cost": 0.25,
                     "profit_drawdown_fraction": 0.3,
                     "profit_drawdown_min_profit_usdc": 1.0,
-                    "websocket_peak_price_fields": ["price", "best_bid", "bid", "last_trade_price"],
+                    "websocket_peak_price_fields": ["best_bid", "bid"],
                     "allowed_cities": sorted(US_WEATHER_CITIES),
                     "websocket_persistent": True,
                     "websocket_reconnect_seconds": 5,
@@ -1358,7 +1361,9 @@ def read_trades(path: str) -> list[PaperTrade]:
                 "buy_fee_usdc",
                 "total_cost_usdc",
                 "exit_yes_price",
+                "exit_no_price",
                 "exit_fee_usdc",
+                "exit_hedge_cost_usdc",
                 "exit_proceeds_usdc",
                 "monitor_last_yes_price",
                 "monitor_price_trigger",
@@ -1376,6 +1381,7 @@ def read_trades(path: str) -> list[PaperTrade]:
         cleaned.setdefault("comparable_unit", cleaned.get("forecast_unit", ""))
         cleaned.setdefault("exit_at", "")
         cleaned.setdefault("exit_reason", "")
+        cleaned.setdefault("exit_action", "")
         cleaned.setdefault("monitor_last_checked_at", "")
         for field in {
             "notional_usdc",
@@ -1384,6 +1390,7 @@ def read_trades(path: str) -> list[PaperTrade]:
             "buy_fee_usdc",
             "total_cost_usdc",
             "exit_fee_usdc",
+            "exit_hedge_cost_usdc",
             "exit_proceeds_usdc",
             "monitor_price_trigger",
             "monitor_peak_pnl_usdc",
@@ -1673,7 +1680,13 @@ def strategy4_exit_metrics(
             yes_best_ask = None
     if yes_best_bid is not None and yes_best_bid > 0:
         sell_yes = yes_best_bid
-    current_no = outcome_price(raw_current_market, "No") if isinstance(raw_current_market, dict) else None
+    mark_no = outcome_price(raw_current_market, "No") if isinstance(raw_current_market, dict) else None
+    implied_no_ask = None
+    if yes_best_bid is not None and 0 < yes_best_bid < 1:
+        implied_no_ask = max(0.0, 1.0 - yes_best_bid)
+    current_no = mark_no
+    if implied_no_ask is not None:
+        current_no = max(float(mark_no), implied_no_ask) if mark_no is not None else implied_no_ask
     fee_enabled = bool(config["trading"]["fee_enabled"])
     fee_rate = float(trade.taker_fee_rate)
     sell_fee = taker_fee_usdc(trade.shares, sell_yes, fee_rate, fee_enabled)
@@ -1682,10 +1695,11 @@ def strategy4_exit_metrics(
     hedge_pnl = -999999.0
     hedge_proceeds = 0.0
     hedge_fee = 0.0
+    hedge_cost = 0.0
     if current_no is not None and current_no > 0:
         hedge_fee = taker_fee_usdc(trade.shares, float(current_no), fee_rate, fee_enabled)
-        no_cost = trade.shares * float(current_no) + hedge_fee
-        hedge_proceeds = trade.shares - no_cost
+        hedge_cost = trade.shares * float(current_no) + hedge_fee
+        hedge_proceeds = trade.shares - hedge_cost
         hedge_pnl = hedge_proceeds - trade.total_cost_usdc
     use_hedge = current_no is not None and hedge_pnl > sell_pnl
     return {
@@ -1693,11 +1707,14 @@ def strategy4_exit_metrics(
         "mark_yes": mark_yes,
         "yes_best_bid": yes_best_bid,
         "yes_best_ask": yes_best_ask,
+        "mark_no": mark_no,
+        "implied_no_ask": implied_no_ask,
         "current_no": current_no,
         "sell_fee": sell_fee,
         "sell_proceeds": sell_proceeds,
         "sell_pnl": sell_pnl,
         "hedge_fee": hedge_fee,
+        "hedge_cost": hedge_cost,
         "hedge_proceeds": hedge_proceeds,
         "hedge_pnl": hedge_pnl,
         "use_hedge": use_hedge,
@@ -1716,12 +1733,15 @@ def apply_strategy4_exit(
     trade.status = "SOLD"
     trade.exit_at = now_text
     trade.exit_reason = exit_reason
+    trade.exit_action = "buy_no_hedge" if use_hedge else "sell_yes"
     trade.exit_yes_price = float(metrics["current_yes"])
+    trade.exit_no_price = float(metrics["current_no"]) if use_hedge and metrics["current_no"] is not None else None
     trade.exit_fee_usdc = round(float(metrics["hedge_fee"] if use_hedge else metrics["sell_fee"]), 8)
+    trade.exit_hedge_cost_usdc = round(float(metrics["hedge_cost"] if use_hedge else 0.0), 8)
     trade.exit_proceeds_usdc = round(float(metrics["hedge_proceeds"] if use_hedge else metrics["sell_proceeds"]), 8)
     trade.payout_usdc = trade.exit_proceeds_usdc
     trade.pnl_usdc = round(float(metrics["hedge_pnl"] if use_hedge else metrics["sell_pnl"]), 8)
-    return "buy_no_hedge" if use_hedge else "sell_yes"
+    return trade.exit_action
 
 
 def process_strategy4_reprice_on_trigger(
@@ -1791,8 +1811,8 @@ def process_strategy4_reprice_on_trigger(
                 LOGGER.warning("strategy4 monitor skip trade=%s reason=current_market_price_missing market=%s", trade.trade_id, trade.market_id)
                 continue
 
-            current_yes = float(current_choice.yes_price)
             metrics = strategy4_exit_metrics(strategy_config, trade, current_choice)
+            current_yes = float(metrics["current_yes"])
             baseline = float(trade.monitor_last_yes_price if trade.monitor_last_yes_price is not None else trade.yes_price or current_yes)
             trigger = float(trade.monitor_price_trigger or trigger_default)
             delta = round(current_yes - baseline, 8)
@@ -1857,16 +1877,17 @@ def process_strategy4_reprice_on_trigger(
                 drawdown = peak_pnl - best_pnl
                 drawdown_threshold = peak_pnl * profit_drawdown_fraction
                 if stop_loss_fraction > 0 and sell_pnl <= -stop_loss_amount:
+                    use_hedge = bool(metrics["use_hedge"])
                     action = apply_strategy4_exit(
                         trade,
                         now_text=now_text,
                         exit_reason=f"strategy4_stop_loss_forecast_same_loss_fraction_{stop_loss_fraction:g}",
                         metrics=metrics,
-                        use_hedge=False,
+                        use_hedge=use_hedge,
                     )
                     changed_count += 1
                     LOGGER.info(
-                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=stop_loss action=%s current_yes=%s current_no=%s sell_pnl=%s stop_loss_amount=%s peak_pnl=%s exit_fee=%s proceeds=%s pnl=%s",
+                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=stop_loss action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s stop_loss_amount=%s peak_pnl=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
                         trade.trade_id,
                         trade.city,
                         trade.kind,
@@ -1875,9 +1896,12 @@ def process_strategy4_reprice_on_trigger(
                         current_yes,
                         metrics["current_no"] if metrics["current_no"] is not None else "",
                         round(sell_pnl, 8),
+                        round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
+                        round(float(metrics["best_pnl"]), 8),
                         round(stop_loss_amount, 8),
                         round(peak_pnl, 8),
                         trade.exit_fee_usdc,
+                        trade.exit_hedge_cost_usdc,
                         trade.exit_proceeds_usdc,
                         trade.pnl_usdc,
                     )
@@ -1897,7 +1921,7 @@ def process_strategy4_reprice_on_trigger(
                     )
                     changed_count += 1
                     LOGGER.info(
-                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=profit_drawdown action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s peak_pnl=%s drawdown=%s threshold=%s exit_fee=%s proceeds=%s pnl=%s",
+                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=profit_drawdown action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s peak_pnl=%s drawdown=%s threshold=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
                         trade.trade_id,
                         trade.city,
                         trade.kind,
@@ -1912,6 +1936,7 @@ def process_strategy4_reprice_on_trigger(
                         round(drawdown, 8),
                         round(drawdown_threshold, 8),
                         trade.exit_fee_usdc,
+                        trade.exit_hedge_cost_usdc,
                         trade.exit_proceeds_usdc,
                         trade.pnl_usdc,
                     )
@@ -1944,7 +1969,7 @@ def process_strategy4_reprice_on_trigger(
             action = apply_strategy4_exit(trade, now_text=now_text, exit_reason=exit_reason, metrics=metrics, use_hedge=use_hedge)
             changed_count += 1
             LOGGER.info(
-                "strategy4 exit trade=%s city=%s kind=%s old_market=%s latest_market=%s current_yes=%s current_no=%s delta=%s action=%s sell_pnl=%s hedge_pnl=%s exit_fee=%s proceeds=%s pnl=%s",
+                "strategy4 exit trade=%s city=%s kind=%s old_market=%s latest_market=%s current_yes=%s current_no=%s delta=%s action=%s sell_pnl=%s hedge_pnl=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
                 trade.trade_id,
                 trade.city,
                 trade.kind,
@@ -1957,6 +1982,7 @@ def process_strategy4_reprice_on_trigger(
                 round(float(metrics["sell_pnl"]), 8),
                 round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
                 trade.exit_fee_usdc,
+                trade.exit_hedge_cost_usdc,
                 trade.exit_proceeds_usdc,
                 trade.pnl_usdc,
             )
