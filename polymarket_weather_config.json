@@ -3,7 +3,7 @@
     "polymarket_gamma_base": "https://gamma-api.polymarket.com",
     "weather_company_base": "https://api.weather.com",
     "twc_api_key_env": "TWC_API_KEY",
-    "twc_api_key": "",
+    "twc_api_key": "e1f10a1e78da46f5b10a1e78da96f525",
     "twc_duration": "2day",
     "twc_units": "e",
     "twc_language": "en-US",
@@ -11,9 +11,23 @@
     "per_request_delay_seconds": 0.25
   },
   "events": {
-    "target_dates": ["today"],
+    "target_dates": [
+      "today"
+    ],
     "city_filter": "",
-    "allowed_cities": ["Atlanta", "Austin", "Chicago", "Dallas", "Denver", "Houston", "Los Angeles", "Miami", "NYC", "San Francisco", "Seattle"],
+    "allowed_cities": [
+      "Atlanta",
+      "Austin",
+      "Chicago",
+      "Dallas",
+      "Denver",
+      "Houston",
+      "Los Angeles",
+      "Miami",
+      "NYC",
+      "San Francisco",
+      "Seattle"
+    ],
     "include_closed": false,
     "max_offsets": 1200,
     "city_timezones": {
@@ -88,7 +102,19 @@
     "profit_drawdown_min_profit_usdc": 1.0,
     "exit_max_slippage_from_mark": 0.03,
     "websocket_peak_price_fields": [],
-    "allowed_cities": ["Atlanta", "Austin", "Chicago", "Dallas", "Denver", "Houston", "Los Angeles", "Miami", "NYC", "San Francisco", "Seattle"],
+    "allowed_cities": [
+      "Atlanta",
+      "Austin",
+      "Chicago",
+      "Dallas",
+      "Denver",
+      "Houston",
+      "Los Angeles",
+      "Miami",
+      "NYC",
+      "San Francisco",
+      "Seattle"
+    ],
     "websocket_persistent": true,
     "websocket_reconnect_seconds": 5,
     "websocket_enabled": true,
@@ -124,7 +150,9 @@
   "polymarket_price_snapshots": {
     "enabled": false,
     "run_every_minutes": 1,
-    "target_dates": ["today"],
+    "target_dates": [
+      "today"
+    ],
     "time_windows_enabled": true,
     "lowest_local_hour_window": "0-6",
     "highest_local_hour_window": "12-18"
@@ -132,7 +160,9 @@
   "twc_raw_collection": {
     "enabled": false,
     "run_every_minutes": 15,
-    "target_dates": ["today"],
+    "target_dates": [
+      "today"
+    ],
     "time_windows_enabled": true,
     "lowest_local_hour_window": "0-6",
     "highest_local_hour_window": "12-18",
@@ -148,7 +178,9 @@
       "run_every_minutes": 15,
       "align_to_top_of_hour": false,
       "events": {
-        "target_dates": ["today"]
+        "target_dates": [
+          "today"
+        ]
       },
       "trading": {
         "strategy_name": "twc_reprice_momentum",
@@ -161,7 +193,19 @@
         "profit_drawdown_min_profit_usdc": 1.0,
         "exit_max_slippage_from_mark": 0.03,
         "websocket_peak_price_fields": [],
-        "allowed_cities": ["Atlanta", "Austin", "Chicago", "Dallas", "Denver", "Houston", "Los Angeles", "Miami", "NYC", "San Francisco", "Seattle"],
+        "allowed_cities": [
+          "Atlanta",
+          "Austin",
+          "Chicago",
+          "Dallas",
+          "Denver",
+          "Houston",
+          "Los Angeles",
+          "Miami",
+          "NYC",
+          "San Francisco",
+          "Seattle"
+        ],
         "websocket_persistent": true,
         "websocket_reconnect_seconds": 5,
         "websocket_enabled": true,

@@ -476,9 +476,9 @@ def gamma_get(config: dict[str, Any], path: str, params: Optional[dict[str, Any]
 
 def twc_get(config: dict[str, Any], path: str, params: dict[str, Any]) -> Any:
     env_name = str(config["api"].get("twc_api_key_env", "TWC_API_KEY")).strip()
-    api_key = os.environ.get(env_name, "").strip() if env_name else ""
+    api_key = str(config["api"].get("twc_api_key", "")).strip()
     if not api_key:
-        api_key = str(config["api"].get("twc_api_key", "")).strip()
+        api_key = os.environ.get(env_name, "").strip() if env_name else ""
     if not api_key:
         raise RuntimeError(f"Missing Weather Company API key. Set environment variable {env_name!r} or config api.twc_api_key.")
     timeout = int(config["api"]["request_timeout_seconds"])
