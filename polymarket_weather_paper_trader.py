@@ -353,7 +353,8 @@ def default_config() -> dict[str, Any]:
                     "stop_loss_fraction_of_cost": 0.25,
                     "profit_drawdown_fraction": 0.3,
                     "profit_drawdown_min_profit_usdc": 1.0,
-                    "websocket_peak_price_fields": ["best_bid", "bid"],
+                    "exit_max_slippage_from_mark": 0.03,
+                    "websocket_peak_price_fields": [],
                     "allowed_cities": sorted(US_WEATHER_CITIES),
                     "websocket_persistent": True,
                     "websocket_reconnect_seconds": 5,
@@ -361,13 +362,14 @@ def default_config() -> dict[str, Any]:
                     "websocket_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
                     "websocket_ping_seconds": 10,
                     "websocket_timeout_seconds": 10,
+                    "websocket_asset_refresh_seconds": 300,
                     "lowest_local_start": "00:15",
                     "highest_local_start": "12:15",
                     "lowest_local_end": "06:00",
                     "highest_local_end": "18:00",
-                    "forecast_scope": "event_day_full",
-                    "forecast_horizon_hours": 24,
-                    "include_observed_today": False,
+                    "forecast_scope": "next_hours_plus_observed",
+                    "forecast_horizon_hours": 6,
+                    "include_observed_today": True,
                 },
             },
         ],
@@ -790,15 +792,16 @@ def twc_hourly_forecast_by_icao(config: dict[str, Any], icao_code: str, units: O
     )
 
 
-def twc_historical_hourly_by_icao(config: dict[str, Any], icao_code: str, units: str) -> dict[str, Any]:
+def twc_historical_observations_by_icao(config: dict[str, Any], icao_code: str, units: str, event_date: str) -> dict[str, Any]:
+    query_date = event_date.replace("-", "")
+    location_id = f"{icao_code}:9:US"
     return twc_get(
         config,
-        "/v3/wx/conditions/historical/hourly/1day",
+        f"/v1/location/{location_id}/observations/historical.json",
         {
-            "icaoCode": icao_code,
             "units": units,
-            "language": config["api"]["twc_language"],
-            "format": "json",
+            "startDate": query_date,
+            "endDate": query_date,
         },
     )
 
@@ -861,20 +864,28 @@ def filtered_twc_points(
     return matched
 
 
-def observed_twc_points(payload: dict[str, Any], event_date: str, current_local: Optional[datetime]) -> list[tuple[datetime, float]]:
-    temps = payload.get("temperature") or []
-    times = payload.get("validTimeLocal") or []
+def observed_twc_observation_points(payload: dict[str, Any], event_date: str, current_local: Optional[datetime]) -> list[tuple[datetime, float]]:
+    observations = payload.get("observations") or []
+    if not isinstance(observations, list):
+        return []
+    local_tz = current_local.tzinfo if current_local and current_local.tzinfo else timezone.utc
     matched: list[tuple[datetime, float]] = []
-    for idx, raw_time in enumerate(times):
-        if idx >= len(temps) or temps[idx] is None:
+    for row in observations:
+        if not isinstance(row, dict):
             continue
-        local_dt = parse_twc_local_time(str(raw_time))
-        if not local_dt:
+        raw_time = row.get("valid_time_gmt")
+        raw_temp = row.get("temp")
+        if raw_time is None or raw_temp is None:
+            continue
+        try:
+            local_dt = datetime.fromtimestamp(int(raw_time), timezone.utc).astimezone(local_tz)
+            temp = float(raw_temp)
+        except (TypeError, ValueError, OSError):
             continue
         if local_dt.date().isoformat() != event_date:
             continue
         if current_local is None or local_dt <= current_local:
-            matched.append((local_dt, float(temps[idx])))
+            matched.append((local_dt, temp))
     return sorted(matched, key=lambda item: item[0])
 
 
@@ -1499,6 +1510,20 @@ def fetch_event_by_trade(config: dict[str, Any], trade: PaperTrade) -> Optional[
     return event
 
 
+def fetch_event_by_url(config: dict[str, Any], event_url: str, city: str, kind: str, event_date: str) -> Optional[dict[str, Any]]:
+    slug = event_url.rstrip("/").split("/")[-1]
+    if not slug:
+        return None
+    try:
+        event = gamma_get(config, f"/events/slug/{slug}")
+    except requests.HTTPError:
+        return None
+    event["_parsed_kind"] = kind
+    event["_parsed_city"] = city
+    event["_parsed_event_date"] = event_date
+    return event
+
+
 def evaluate_trade_forecast_market(config: dict[str, Any], trade: PaperTrade) -> Optional[TemperatureMarket]:
     event = fetch_event_by_trade(config, trade)
     if not event:
@@ -1519,8 +1544,8 @@ def evaluate_trade_forecast_market(config: dict[str, Any], trade: PaperTrade) ->
     observed_points: list[tuple[datetime, float]] = []
     if config["trading"].get("include_observed_today", True) and datetime.strptime(trade.event_date, "%Y-%m-%d").date() <= date.today():
         city_local_dt, _, _ = city_local_now(config, trade.city)
-        historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
-        observed_points = observed_twc_points(historical_payload, trade.event_date, city_local_dt)
+        historical_payload = twc_historical_observations_by_icao(config, station, units=twc_units, event_date=trade.event_date)
+        observed_points = observed_twc_observation_points(historical_payload, trade.event_date, city_local_dt)
 
     combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
     high, low, _, _, _, _ = summarize_points(combined_points)
@@ -1666,7 +1691,7 @@ def strategy4_exit_metrics(
 ) -> dict[str, Any]:
     raw_current_market = parse_jsonish(current_choice.raw_market_json, {})
     mark_yes = float(current_choice.yes_price or 0.0)
-    sell_yes = mark_yes
+    sell_yes = 0.0
     yes_best_bid = None
     yes_best_ask = None
     if isinstance(raw_current_market, dict):
@@ -1684,11 +1709,13 @@ def strategy4_exit_metrics(
     implied_no_ask = None
     if yes_best_bid is not None and 0 < yes_best_bid < 1:
         implied_no_ask = max(0.0, 1.0 - yes_best_bid)
-    current_no = mark_no
-    if implied_no_ask is not None:
-        current_no = max(float(mark_no), implied_no_ask) if mark_no is not None else implied_no_ask
+    current_no = implied_no_ask if implied_no_ask is not None else mark_no
     fee_enabled = bool(config["trading"]["fee_enabled"])
     fee_rate = float(trade.taker_fee_rate)
+    mark_fee = taker_fee_usdc(trade.shares, mark_yes, fee_rate, fee_enabled)
+    mark_value = trade.shares * mark_yes - mark_fee
+    mark_pnl = mark_value - trade.total_cost_usdc
+    mark_unit_delta = mark_yes - float(trade.yes_price or 0.0)
     sell_fee = taker_fee_usdc(trade.shares, sell_yes, fee_rate, fee_enabled)
     sell_proceeds = trade.shares * sell_yes - sell_fee
     sell_pnl = sell_proceeds - trade.total_cost_usdc
@@ -1702,14 +1729,25 @@ def strategy4_exit_metrics(
         hedge_proceeds = trade.shares - hedge_cost
         hedge_pnl = hedge_proceeds - trade.total_cost_usdc
     use_hedge = current_no is not None and hedge_pnl > sell_pnl
+    best_executable_pnl = hedge_pnl if use_hedge else sell_pnl
+    best_executable_action = "buy_no_hedge" if use_hedge else "sell_yes"
+    max_slippage = float(config["trading"].get("exit_max_slippage_from_mark", 0.03))
+    max_slippage_usdc = trade.shares * max_slippage
+    executable_available = bool((sell_yes > 0) or (current_no is not None and current_no > 0))
+    maker_hold = bool((not executable_available) or best_executable_pnl < mark_pnl - max_slippage_usdc)
     return {
-        "current_yes": sell_yes,
+        "current_yes": mark_yes,
         "mark_yes": mark_yes,
+        "mark_fee": mark_fee,
+        "mark_value": mark_value,
+        "mark_pnl": mark_pnl,
+        "mark_unit_delta": mark_unit_delta,
         "yes_best_bid": yes_best_bid,
         "yes_best_ask": yes_best_ask,
         "mark_no": mark_no,
         "implied_no_ask": implied_no_ask,
         "current_no": current_no,
+        "sell_yes": sell_yes,
         "sell_fee": sell_fee,
         "sell_proceeds": sell_proceeds,
         "sell_pnl": sell_pnl,
@@ -1718,7 +1756,13 @@ def strategy4_exit_metrics(
         "hedge_proceeds": hedge_proceeds,
         "hedge_pnl": hedge_pnl,
         "use_hedge": use_hedge,
-        "best_pnl": hedge_pnl if use_hedge else sell_pnl,
+        "best_pnl": best_executable_pnl,
+        "best_executable_pnl": best_executable_pnl,
+        "best_executable_action": best_executable_action,
+        "max_slippage_usdc": max_slippage_usdc,
+        "maker_hold": maker_hold,
+        "maker_price": mark_yes,
+        "maker_pnl": mark_pnl,
     }
 
 
@@ -1734,7 +1778,7 @@ def apply_strategy4_exit(
     trade.exit_at = now_text
     trade.exit_reason = exit_reason
     trade.exit_action = "buy_no_hedge" if use_hedge else "sell_yes"
-    trade.exit_yes_price = float(metrics["current_yes"])
+    trade.exit_yes_price = float(metrics["current_yes"] if use_hedge else metrics["sell_yes"])
     trade.exit_no_price = float(metrics["current_no"]) if use_hedge and metrics["current_no"] is not None else None
     trade.exit_fee_usdc = round(float(metrics["hedge_fee"] if use_hedge else metrics["sell_fee"]), 8)
     trade.exit_hedge_cost_usdc = round(float(metrics["hedge_cost"] if use_hedge else 0.0), 8)
@@ -1869,14 +1913,31 @@ def process_strategy4_reprice_on_trigger(
                     float(trade.monitor_peak_pnl_usdc or 0.0),
                     float(STRATEGY4_PEAK_PNL_BY_TRADE.get(trade.trade_id, 0.0)),
                 )
-                best_pnl = float(metrics["best_pnl"])
-                peak_pnl = previous_peak
+                mark_pnl = float(metrics["mark_pnl"])
+                peak_pnl = max(previous_peak, mark_pnl)
                 trade.monitor_peak_pnl_usdc = round(peak_pnl, 8)
-                sell_pnl = float(metrics["sell_pnl"])
                 stop_loss_amount = trade.total_cost_usdc * stop_loss_fraction
-                drawdown = peak_pnl - best_pnl
+                drawdown = peak_pnl - mark_pnl
                 drawdown_threshold = peak_pnl * profit_drawdown_fraction
-                if stop_loss_fraction > 0 and sell_pnl <= -stop_loss_amount:
+                if stop_loss_fraction > 0 and mark_pnl <= -stop_loss_amount:
+                    if metrics["maker_hold"]:
+                        trade.monitor_last_yes_price = current_yes
+                        LOGGER.info(
+                            "strategy4 maker_hold trade=%s city=%s kind=%s market=%s reason=stop_loss mark_yes=%s mark_pnl=%s best_action=%s best_pnl=%s sell_yes=%s hedge_no=%s max_slippage_usdc=%s maker_price=%s",
+                            trade.trade_id,
+                            trade.city,
+                            trade.kind,
+                            trade.market_id,
+                            current_yes,
+                            round(mark_pnl, 8),
+                            metrics["best_executable_action"],
+                            round(float(metrics["best_executable_pnl"]), 8),
+                            metrics["sell_yes"],
+                            metrics["current_no"] if metrics["current_no"] is not None else "",
+                            round(float(metrics["max_slippage_usdc"]), 8),
+                            metrics["maker_price"],
+                        )
+                        continue
                     use_hedge = bool(metrics["use_hedge"])
                     action = apply_strategy4_exit(
                         trade,
@@ -1887,7 +1948,7 @@ def process_strategy4_reprice_on_trigger(
                     )
                     changed_count += 1
                     LOGGER.info(
-                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=stop_loss action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s stop_loss_amount=%s peak_pnl=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
+                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=stop_loss action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s mark_pnl=%s stop_loss_amount=%s peak_pnl=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
                         trade.trade_id,
                         trade.city,
                         trade.kind,
@@ -1895,9 +1956,9 @@ def process_strategy4_reprice_on_trigger(
                         action,
                         current_yes,
                         metrics["current_no"] if metrics["current_no"] is not None else "",
-                        round(sell_pnl, 8),
+                        round(float(metrics["sell_pnl"]), 8),
                         round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
-                        round(float(metrics["best_pnl"]), 8),
+                        round(mark_pnl, 8),
                         round(stop_loss_amount, 8),
                         round(peak_pnl, 8),
                         trade.exit_fee_usdc,
@@ -1911,6 +1972,26 @@ def process_strategy4_reprice_on_trigger(
                     and peak_pnl >= profit_drawdown_min_profit
                     and drawdown >= drawdown_threshold
                 ):
+                    if metrics["maker_hold"]:
+                        trade.monitor_last_yes_price = current_yes
+                        LOGGER.info(
+                            "strategy4 maker_hold trade=%s city=%s kind=%s market=%s reason=profit_drawdown mark_yes=%s mark_pnl=%s peak_pnl=%s drawdown=%s best_action=%s best_pnl=%s sell_yes=%s hedge_no=%s max_slippage_usdc=%s maker_price=%s",
+                            trade.trade_id,
+                            trade.city,
+                            trade.kind,
+                            trade.market_id,
+                            current_yes,
+                            round(mark_pnl, 8),
+                            round(peak_pnl, 8),
+                            round(drawdown, 8),
+                            metrics["best_executable_action"],
+                            round(float(metrics["best_executable_pnl"]), 8),
+                            metrics["sell_yes"],
+                            metrics["current_no"] if metrics["current_no"] is not None else "",
+                            round(float(metrics["max_slippage_usdc"]), 8),
+                            metrics["maker_price"],
+                        )
+                        continue
                     use_hedge = bool(metrics["use_hedge"])
                     action = apply_strategy4_exit(
                         trade,
@@ -1921,7 +2002,7 @@ def process_strategy4_reprice_on_trigger(
                     )
                     changed_count += 1
                     LOGGER.info(
-                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=profit_drawdown action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s peak_pnl=%s drawdown=%s threshold=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
+                        "strategy4 risk_exit trade=%s city=%s kind=%s market=%s reason=profit_drawdown action=%s current_yes=%s current_no=%s sell_pnl=%s hedge_pnl=%s mark_pnl=%s peak_pnl=%s drawdown=%s threshold=%s exit_fee=%s hedge_cost=%s proceeds=%s pnl=%s",
                         trade.trade_id,
                         trade.city,
                         trade.kind,
@@ -1931,7 +2012,7 @@ def process_strategy4_reprice_on_trigger(
                         metrics["current_no"] if metrics["current_no"] is not None else "",
                         round(float(metrics["sell_pnl"]), 8),
                         round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
-                        round(best_pnl, 8),
+                        round(mark_pnl, 8),
                         round(peak_pnl, 8),
                         round(drawdown, 8),
                         round(drawdown_threshold, 8),
@@ -1943,7 +2024,7 @@ def process_strategy4_reprice_on_trigger(
                     continue
                 trade.monitor_last_yes_price = current_yes
                 LOGGER.info(
-                    "strategy4 monitor repriced_but_forecast_same trade=%s city=%s kind=%s market=%s current_yes=%s current_no=%s delta=%s sell_pnl=%s hedge_pnl=%s best_pnl=%s peak_pnl=%s latest_forecast=%s%s",
+                    "strategy4 monitor repriced_but_forecast_same trade=%s city=%s kind=%s market=%s current_yes=%s current_no=%s delta=%s sell_pnl=%s hedge_pnl=%s mark_pnl=%s peak_pnl=%s latest_forecast=%s%s",
                     trade.trade_id,
                     trade.city,
                     trade.kind,
@@ -1953,10 +2034,30 @@ def process_strategy4_reprice_on_trigger(
                     delta,
                     round(float(metrics["sell_pnl"]), 8),
                     round(float(metrics["hedge_pnl"]), 8) if metrics["current_no"] is not None else "",
-                    round(best_pnl, 8),
+                    round(mark_pnl, 8),
                     round(peak_pnl, 8),
                     forecast_meta.get("forecast_high") if trade.kind == "Highest" else forecast_meta.get("forecast_low"),
                     forecast_meta.get("forecast_unit", ""),
+                )
+                continue
+
+            if metrics["maker_hold"]:
+                trade.monitor_last_yes_price = current_yes
+                LOGGER.info(
+                    "strategy4 maker_hold trade=%s city=%s kind=%s old_market=%s latest_market=%s reason=forecast_changed mark_yes=%s mark_pnl=%s best_action=%s best_pnl=%s sell_yes=%s hedge_no=%s max_slippage_usdc=%s maker_price=%s",
+                    trade.trade_id,
+                    trade.city,
+                    trade.kind,
+                    trade.market_id,
+                    latest_id,
+                    current_yes,
+                    round(float(metrics["mark_pnl"]), 8),
+                    metrics["best_executable_action"],
+                    round(float(metrics["best_executable_pnl"]), 8),
+                    metrics["sell_yes"],
+                    metrics["current_no"] if metrics["current_no"] is not None else "",
+                    round(float(metrics["max_slippage_usdc"]), 8),
+                    metrics["maker_price"],
                 )
                 continue
 
@@ -2033,6 +2134,117 @@ def process_strategy4_reprice_on_trigger(
     return trades
 
 
+def process_strategy4_event_price_trigger(config: dict[str, Any], trigger_context: dict[str, Any]) -> list[PaperTrade]:
+    strategy_config = next(
+        (
+            strategy_config
+            for strategy_config in active_strategy_configs(config)
+            if strategy_config["trading"].get("strategy_mode") == "twc_reprice_momentum"
+        ),
+        {},
+    )
+    if not strategy_config:
+        return []
+    strategy_name = str(strategy_config["trading"]["strategy_name"])
+    city = str(trigger_context.get("city") or "")
+    kind = str(trigger_context.get("kind") or "")
+    event_date = str(trigger_context.get("event_date") or "")
+    event_url = str(trigger_context.get("polymarket_url") or "")
+    if not city or not kind or not event_date or not event_url:
+        return []
+
+    trades = read_trades(config["outputs"]["trades_csv"])
+    if any(t.status == "OPEN" and t.strategy == strategy_name and t.city == city and t.kind == kind and t.event_date == event_date for t in trades):
+        return process_strategy4_reprice_on_trigger(config, force=True, trigger_context=trigger_context)
+
+    cycle_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f":{strategy_name}:websocket_event"
+    event = fetch_event_by_url(strategy_config, event_url, city, kind, event_date)
+    if not event:
+        LOGGER.warning("strategy4 websocket event skip city=%s kind=%s reason=event_not_found url=%s", city, kind, event_url)
+        return []
+    try:
+        markets = markets_for_event(strategy_config, event)
+        event_unit = event_market_unit(markets)
+        wu_source = extract_wunderground_source(strategy_config, event_url)
+        station = station_from_wu_url(wu_source)
+        if not station:
+            LOGGER.warning("strategy4 websocket event skip city=%s kind=%s reason=missing_station url=%s", city, kind, event_url)
+            return []
+        city_local_dt, city_timezone, city_time_source = city_local_now(strategy_config, city)
+        chosen, forecast_meta, wide_rows = best_twc_matching_market_for_event(
+            strategy_config,
+            cycle_id,
+            event,
+            markets,
+            station,
+            event_unit,
+            event_url,
+            wu_source,
+            city_local_dt,
+            city_timezone,
+        )
+        max_buy_yes_price = float(strategy_config["trading"].get("max_buy_yes_price", 0.5))
+        should_buy = bool(chosen and chosen.yes_price is not None and chosen.yes_price > 0 and chosen.yes_price <= max_buy_yes_price)
+        snapshot = snapshot_row_for_strategy4(
+            config=strategy_config,
+            cycle_id=cycle_id,
+            strategy_name=strategy_name,
+            target=datetime.strptime(event_date, "%Y-%m-%d").date(),
+            event=event,
+            event_url=event_url,
+            city_local_dt=city_local_dt,
+            city_timezone=city_timezone,
+            city_time_source=city_time_source,
+            window_text="websocket_anytime",
+            window_allowed=True,
+            window_reason="websocket_price_trigger",
+            event_unit=event_unit,
+            station=station,
+            wu_source=wu_source,
+            chosen=chosen,
+            forecast_meta=forecast_meta,
+            max_buy_yes_price=max_buy_yes_price,
+            should_buy=should_buy,
+            error="" if should_buy else ("price_above_max_buy_or_no_usable_market" if chosen else "no_usable_market"),
+        )
+        append_csv(config["outputs"]["snapshots_csv"], [snapshot])
+        append_twc_raw_wide(config, wide_rows)
+        if not should_buy or not chosen:
+            LOGGER.info(
+                "strategy4 websocket event skip_buy city=%s kind=%s forecast=%s%s market=%s price=%s max_buy=%s reason=%s",
+                city,
+                kind,
+                forecast_meta.get("forecast_high") if kind == "Highest" else forecast_meta.get("forecast_low"),
+                event_unit,
+                chosen.market_id if chosen else "",
+                chosen.yes_price if chosen else "",
+                max_buy_yes_price,
+                "price_above_max_buy" if chosen else "no_usable_market",
+            )
+            return []
+        new_trade = make_strategy4_trade(strategy_config, cycle_id, chosen, wu_source, station, forecast_meta)
+        append_csv(config["outputs"]["trades_csv"], [asdict(new_trade)])
+        updated_trades = read_trades(config["outputs"]["trades_csv"])
+        write_csv(config["outputs"]["settled_trades_csv"], updated_trades)
+        write_performance_reports(config, updated_trades)
+        LOGGER.info(
+            "strategy4 websocket event buy trade=%s city=%s kind=%s forecast=%s%s market=%s price=%s trigger_market=%s trigger_price=%s",
+            new_trade.trade_id,
+            city,
+            kind,
+            new_trade.forecast_temp,
+            new_trade.forecast_unit,
+            new_trade.market_id,
+            new_trade.yes_price,
+            trigger_context.get("market_id", ""),
+            trigger_context.get("price", ""),
+        )
+        return updated_trades
+    except Exception:
+        LOGGER.exception("strategy4 websocket event failed city=%s kind=%s url=%s", city, kind, event_url)
+        return []
+
+
 def market_clob_tokens(market_json: dict[str, Any]) -> list[tuple[str, str]]:
     outcomes = parse_jsonish(market_json.get("outcomes"), [])
     token_ids = (
@@ -2089,53 +2301,62 @@ def strategy4_open_trades(config: dict[str, Any]) -> tuple[dict[str, Any], list[
 
 def strategy4_websocket_assets(config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     strategy_config, trades = strategy4_open_trades(config)
-    if not strategy_config or not trades:
+    if not strategy_config:
         return strategy_config, {}
     assets: dict[str, dict[str, Any]] = {}
-    trades_by_event: dict[str, PaperTrade] = {}
+    trades_by_event_market: dict[tuple[str, str, str, str], PaperTrade] = {}
     for trade in trades:
-        event_key = f"{trade.event_date}|{trade.city}|{trade.kind}|{trade.polymarket_url}"
-        if event_key in trades_by_event:
-            continue
-        trades_by_event[event_key] = trade
-        event = fetch_event_by_trade(strategy_config, trade)
-        if not event:
-            continue
+        trades_by_event_market[(trade.event_date, trade.city, trade.kind, trade.market_id)] = trade
+
+    target_dates = [resolve_date(str(v)) for v in strategy_config["events"]["target_dates"]]
+    for target in target_dates:
         try:
-            markets = markets_for_event(strategy_config, event)
+            events = discover_temperature_events(strategy_config, target)
         except Exception:
-            LOGGER.exception("strategy4 websocket asset discovery failed city=%s kind=%s url=%s", trade.city, trade.kind, trade.polymarket_url)
+            LOGGER.exception("strategy4 websocket event discovery failed target=%s", target.isoformat())
             continue
-        for market in markets:
-            raw_market = parse_jsonish(market.raw_market_json, {})
-            if not isinstance(raw_market, dict):
+        for event in events:
+            event_url = poly_url_from_event(event)
+            city = event.get("_parsed_city", "")
+            kind = event.get("_parsed_kind", "")
+            event_date = event.get("_parsed_event_date", target.isoformat())
+            try:
+                markets = markets_for_event(strategy_config, event)
+            except Exception:
+                LOGGER.exception("strategy4 websocket asset discovery failed city=%s kind=%s url=%s", city, kind, event_url)
                 continue
-            outcome_prices = parse_jsonish(raw_market.get("outcomePrices"), [])
-            for idx, (asset_id, outcome) in enumerate(market_clob_tokens(raw_market)):
-                baseline = None
-                if isinstance(outcome_prices, list) and idx < len(outcome_prices):
-                    try:
-                        baseline = float(outcome_prices[idx])
-                    except (TypeError, ValueError):
-                        baseline = None
-                is_holding_yes = market.market_id == trade.market_id and str(outcome).lower() == "yes"
-                assets[asset_id] = {
-                    "asset_id": asset_id,
-                    "baseline": baseline,
-                    "last_price": baseline,
-                    "outcome": outcome,
-                    "event_date": trade.event_date,
-                    "city": trade.city,
-                    "kind": trade.kind,
-                    "event_title": trade.event_title,
-                    "market_id": market.market_id,
-                    "market_question": market.market_question,
-                    "polymarket_url": trade.polymarket_url,
-                    "holding_trade_id": trade.trade_id if is_holding_yes else "",
-                    "holding_shares": trade.shares if is_holding_yes else "",
-                    "holding_total_cost_usdc": trade.total_cost_usdc if is_holding_yes else "",
-                    "holding_peak_pnl_usdc": trade.monitor_peak_pnl_usdc if is_holding_yes else "",
-                }
+            for market in markets:
+                raw_market = parse_jsonish(market.raw_market_json, {})
+                if not isinstance(raw_market, dict):
+                    continue
+                outcome_prices = parse_jsonish(raw_market.get("outcomePrices"), [])
+                holding_trade = trades_by_event_market.get((event_date, city, kind, market.market_id))
+                for idx, (asset_id, outcome) in enumerate(market_clob_tokens(raw_market)):
+                    baseline = None
+                    if isinstance(outcome_prices, list) and idx < len(outcome_prices):
+                        try:
+                            baseline = float(outcome_prices[idx])
+                        except (TypeError, ValueError):
+                            baseline = None
+                    is_holding_yes = bool(holding_trade and str(outcome).lower() == "yes")
+                    assets[asset_id] = {
+                        "asset_id": asset_id,
+                        "baseline": baseline,
+                        "last_price": baseline,
+                        "last_prices_by_field": {},
+                        "outcome": outcome,
+                        "event_date": event_date,
+                        "city": city,
+                        "kind": kind,
+                        "event_title": event.get("title") or event.get("question") or "",
+                        "market_id": market.market_id,
+                        "market_question": market.market_question,
+                        "polymarket_url": event_url,
+                        "holding_trade_id": holding_trade.trade_id if is_holding_yes and holding_trade else "",
+                        "holding_shares": holding_trade.shares if is_holding_yes and holding_trade else "",
+                        "holding_total_cost_usdc": holding_trade.total_cost_usdc if is_holding_yes and holding_trade else "",
+                        "holding_peak_pnl_usdc": holding_trade.monitor_peak_pnl_usdc if is_holding_yes and holding_trade else "",
+                    }
     return strategy_config, assets
 
 
@@ -2235,11 +2456,13 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
     ws_url = str(strategy_config["trading"].get("websocket_url", "wss://ws-subscriptions-clob.polymarket.com/ws/market"))
     timeout_seconds = int(strategy_config["trading"].get("websocket_timeout_seconds", 10))
     ping_seconds = int(strategy_config["trading"].get("websocket_ping_seconds", 10))
+    refresh_seconds = int(strategy_config["trading"].get("websocket_asset_refresh_seconds", 300))
     trigger_default = float(strategy_config["trading"].get("monitor_price_change_trigger", 0.05))
     asset_ids = sorted(assets)
     persistent = bool(strategy_config["trading"].get("websocket_persistent", True))
     deadline = None if persistent else time.monotonic() + max(1, duration_seconds)
     next_ping = time.monotonic() + max(1, ping_seconds)
+    next_refresh = time.monotonic() + max(30, refresh_seconds)
     LOGGER.info(
         "strategy4 websocket connect assets=%s events=%s persistent=%s duration=%ss",
         len(asset_ids),
@@ -2253,6 +2476,19 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
         ws = websocket.create_connection(ws_url, timeout=timeout_seconds)
         ws.send(json.dumps({"type": "market", "assets_ids": asset_ids, "asset_ids": asset_ids, "custom_feature_enabled": True}))
         while deadline is None or time.monotonic() < deadline:
+            if time.monotonic() >= next_refresh:
+                strategy_config, refreshed_assets = strategy4_websocket_assets(config)
+                refreshed_ids = sorted(refreshed_assets)
+                if refreshed_ids and refreshed_ids != asset_ids:
+                    assets = refreshed_assets
+                    asset_ids = refreshed_ids
+                    ws.send(json.dumps({"type": "market", "assets_ids": asset_ids, "asset_ids": asset_ids, "custom_feature_enabled": True}))
+                    LOGGER.info(
+                        "strategy4 websocket periodic_resubscribe assets=%s events=%s",
+                        len(asset_ids),
+                        len({a["polymarket_url"] for a in assets.values()}),
+                    )
+                next_refresh = time.monotonic() + max(30, refresh_seconds)
             if time.monotonic() >= next_ping:
                 ws.send("PING")
                 next_ping = time.monotonic() + max(1, ping_seconds)
@@ -2276,12 +2512,17 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
                     continue
                 asset = assets[asset_id]
                 update_strategy4_websocket_peak(config, strategy_config, asset, price, price_field)
-                baseline = asset.get("last_price")
+                last_prices_by_field = asset.setdefault("last_prices_by_field", {})
+                baseline = last_prices_by_field.get(price_field)
+                if baseline is None:
+                    baseline = asset.get("last_price")
                 delta = None if baseline is None else round(price - float(baseline), 8)
                 if baseline is None:
                     asset["last_price"] = price
+                    last_prices_by_field[price_field] = price
                     continue
                 asset["last_price"] = price
+                last_prices_by_field[price_field] = price
                 trigger = trigger_default
                 if abs(delta) < trigger:
                     continue
@@ -2302,7 +2543,7 @@ def monitor_strategy4_websocket(config: dict[str, Any], duration_seconds: int) -
                     "polymarket_url": asset.get("polymarket_url", ""),
                 }
                 LOGGER.info("strategy4 websocket trigger %s", json.dumps(context, ensure_ascii=False, sort_keys=True))
-                process_strategy4_reprice_on_trigger(config, force=True, trigger_context=context)
+                process_strategy4_event_price_trigger(config, context)
                 strategy_config, refreshed_assets = strategy4_websocket_assets(config)
                 refreshed_ids = sorted(refreshed_assets)
                 if refreshed_ids and refreshed_ids != asset_ids:
@@ -2559,8 +2800,8 @@ def collect_twc_raw_snapshots(config: dict[str, Any], cycle_id: str) -> int:
                 historical_payload: dict[str, Any] = {}
                 observed_points: list[tuple[datetime, float]] = []
                 if collector_config.get("include_observed_today", True) and target <= date.today():
-                    historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
-                    observed_points = observed_twc_points(historical_payload, event["_parsed_event_date"], city_local_dt)
+                    historical_payload = twc_historical_observations_by_icao(config, station, units=twc_units, event_date=event["_parsed_event_date"])
+                    observed_points = observed_twc_observation_points(historical_payload, event["_parsed_event_date"], city_local_dt)
                 combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
                 rows.append(
                     twc_raw_wide_row(
@@ -2712,6 +2953,23 @@ def strategy4_window_status(config: dict[str, Any], kind: str, local_dt: Optiona
     return allowed, window_text, "inside_strategy4_window" if allowed else f"outside_strategy4_window_{window_text}"
 
 
+def strategy4_forecast_horizon_hours(config: dict[str, Any], kind: str, local_dt: Optional[datetime]) -> int:
+    default_hours = int(config["trading"].get("forecast_horizon_hours", 6))
+    if kind != "Highest" or local_dt is None:
+        return max(1, default_hours)
+    start_text = str(config["trading"].get("highest_local_start", "12:15"))
+    end_text = str(config["trading"].get("highest_local_end", "18:00"))
+    current_minutes = minutes_since_midnight(local_dt)
+    start_minutes = hhmm_to_minutes(start_text)
+    end_minutes = hhmm_to_minutes(end_text)
+    if current_minutes >= start_minutes:
+        return max(1, default_hours)
+    minutes_until_end = end_minutes - current_minutes
+    if minutes_until_end <= 0:
+        return max(1, default_hours)
+    return max(default_hours, int(math.ceil(minutes_until_end / 60)))
+
+
 def best_twc_matching_market_for_event(
     config: dict[str, Any],
     cycle_id: str,
@@ -2726,11 +2984,16 @@ def best_twc_matching_market_for_event(
 ) -> tuple[Optional[TemperatureMarket], dict[str, Any], list[dict[str, Any]]]:
     twc_units = twc_units_for_temperature_unit(event_unit)
     payload = twc_hourly_forecast_by_icao(config, station, units=twc_units)
-    if config["trading"].get("forecast_scope") == "event_day_full":
-        forecast_points = daily_twc_points(payload, event["_parsed_event_date"])
-    else:
-        forecast_points = filtered_twc_points(payload, event["_parsed_event_date"], int(config["trading"]["forecast_horizon_hours"]))
-    high, low, first_local, last_local, _, _ = summarize_points(forecast_points)
+    horizon_hours = strategy4_forecast_horizon_hours(config, event["_parsed_kind"], city_local_dt)
+    forecast_points = filtered_twc_points(payload, event["_parsed_event_date"], horizon_hours)
+    target_date = datetime.strptime(event["_parsed_event_date"], "%Y-%m-%d").date()
+    observed_points: list[tuple[datetime, float]] = []
+    historical_payload: dict[str, Any] = {}
+    if config["trading"].get("include_observed_today", True) and (city_local_dt is None or target_date <= city_local_dt.date()):
+        historical_payload = twc_historical_observations_by_icao(config, station, units=twc_units, event_date=event["_parsed_event_date"])
+        observed_points = observed_twc_observation_points(historical_payload, event["_parsed_event_date"], city_local_dt)
+    combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
+    high, low, first_local, last_local, _, _ = summarize_points(combined_points)
     forecasts_by_unit = {event_unit: {"high": high, "low": low}}
     chosen = choose_most_likely_market(markets, forecasts_by_unit, event["_parsed_kind"])
     wide_rows = [
@@ -2745,11 +3008,11 @@ def best_twc_matching_market_for_event(
             twc_units=twc_units,
             city_local_dt=city_local_dt,
             city_timezone=city_timezone,
-            observed_points=[],
+            observed_points=observed_points,
             forecast_points=forecast_points,
-            combined_points=forecast_points,
+            combined_points=combined_points,
             forecast_payload=payload,
-            historical_payload={},
+            historical_payload=historical_payload,
             event_url=event_url,
             wunderground_source_url=wu_source,
         )
@@ -2757,6 +3020,8 @@ def best_twc_matching_market_for_event(
     return chosen, {
         "payload": payload,
         "forecast_points": forecast_points,
+        "observed_points": observed_points,
+        "combined_points": combined_points,
         "forecast_high": high,
         "forecast_low": low,
         "first_local": first_local,
@@ -3647,8 +3912,8 @@ def run_strategy_cycle(config: dict[str, Any], cycle_id: str) -> int:
                 observed_points: list[tuple[datetime, float]] = []
                 historical_payload: dict[str, Any] = {}
                 if config["trading"].get("include_observed_today", True) and target == date.today():
-                    historical_payload = twc_historical_hourly_by_icao(config, station, units=twc_units)
-                    observed_points = observed_twc_points(historical_payload, event["_parsed_event_date"], city_local_dt)
+                    historical_payload = twc_historical_observations_by_icao(config, station, units=twc_units, event_date=event["_parsed_event_date"])
+                    observed_points = observed_twc_observation_points(historical_payload, event["_parsed_event_date"], city_local_dt)
                 combined_points = merge_observed_and_forecast_points(observed_points, forecast_points)
                 twc_wide_rows.append(
                     twc_raw_wide_row(
@@ -3986,7 +4251,11 @@ def run(config: dict[str, Any]) -> None:
     while True:
         cycle_num += 1
         run_cycle(config, cycle_num, last_run_at)
-        process_strategy4_reprice(config)
+        process_strategy4_reprice_on_trigger(
+            config,
+            force=True,
+            trigger_context={"source": "scheduled_cycle_twc_reprice", "cycle_num": cycle_num},
+        )
         if config["scheduler"]["settle_after_each_cycle"]:
             settle_open_trades(config)
             summarize_settled(config)
