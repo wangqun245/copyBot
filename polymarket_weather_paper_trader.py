@@ -308,6 +308,8 @@ def default_config() -> dict[str, Any]:
         "aviation_poll_interval_seconds": 60,
         "aviation_refresh_probe_seconds": 180,
         "weather_record_websocket_reconnect_seconds": 5,
+        "weather_record_websocket_heartbeat_seconds": 20,
+        "weather_record_websocket_read_timeout_seconds": 5,
         "weather_record_pre_window_seconds": 120,
         "weather_record_receive_window_seconds": 300,
         "weather_record_timing_refresh_seconds": 60,
@@ -2039,22 +2041,40 @@ def weather_record_websocket_listener(config: dict[str, Any]) -> None:
         or "wss://jackaisolutions.us/ws/weatherrecord"
     )
     reconnect_seconds = max(1.0, float(config["trading"].get("weather_record_websocket_reconnect_seconds", 5)))
+    heartbeat_seconds = max(5.0, float(config["trading"].get("weather_record_websocket_heartbeat_seconds", 20)))
+    read_timeout_seconds = max(1.0, float(config["trading"].get("weather_record_websocket_read_timeout_seconds", 5)))
     while True:
         ws = None
         try:
             LOGGER.info("weatherrecord websocket connecting url=%s", url)
             ws = websocket.create_connection(url, timeout=30)
-            ws.settimeout(None)
-            LOGGER.info("weatherrecord websocket connected url=%s", url)
+            ws.settimeout(read_timeout_seconds)
+            next_ping_at = time.monotonic() + heartbeat_seconds
+            LOGGER.info(
+                "weatherrecord websocket connected url=%s heartbeat_seconds=%s read_timeout_seconds=%s",
+                url,
+                heartbeat_seconds,
+                read_timeout_seconds,
+            )
             while True:
-                message = ws.recv()
-                if message is None:
-                    raise ConnectionError("weatherrecord websocket closed")
-                if isinstance(message, bytes):
-                    message = message.decode("utf-8")
-                rows = normalize_weather_record_payload(json.loads(message))
-                enqueue_weather_record_update(rows)
-                LOGGER.info("weatherrecord websocket received rows=%s", len(rows))
+                message = None
+                try:
+                    message = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    pass
+                if message is not None:
+                    if message == "":
+                        raise ConnectionError("weatherrecord websocket closed")
+                    if isinstance(message, bytes):
+                        message = message.decode("utf-8")
+                    rows = normalize_weather_record_payload(json.loads(message))
+                    enqueue_weather_record_update(rows)
+                    LOGGER.info("weatherrecord websocket received rows=%s", len(rows))
+                now_mono = time.monotonic()
+                if now_mono >= next_ping_at:
+                    ws.ping()
+                    LOGGER.debug("weatherrecord websocket ping sent")
+                    next_ping_at = now_mono + heartbeat_seconds
         except Exception:
             LOGGER.exception("weatherrecord websocket disconnected; reconnecting in %ss", reconnect_seconds)
         finally:
