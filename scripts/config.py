@@ -54,7 +54,7 @@ class Config:
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
         self.DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
         self.HISTORY_POLL_INTERVAL_SECONDS = float(os.getenv("HISTORY_POLL_INTERVAL_SECONDS", "1"))
-        self.POSITIONS_POLL_INTERVAL_SECONDS = float(os.getenv("POSITIONS_POLL_INTERVAL_SECONDS", "300"))
+        self.POSITIONS_POLL_INTERVAL_SECONDS = float(os.getenv("POSITIONS_POLL_INTERVAL_SECONDS", "30"))
         self.COPY_BUY_MAX_AGE_SECONDS = int(os.getenv("COPY_BUY_MAX_AGE_SECONDS", "600"))
 
         # Telegram Notifications

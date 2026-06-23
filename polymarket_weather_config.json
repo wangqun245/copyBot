@@ -59,8 +59,8 @@
                                      }
                },
     "trading":  {
-                    "strategy_name":  "deterministic_harvest",
-                    "strategy_mode":  "deterministic_harvest",
+                    "strategy_name":  "model_awc_high",
+                    "strategy_mode":  "model_awc_high",
                     "buy_notional_usdc":  5,
                     "fee_rate":  0.05,
                     "fee_enabled":  true,
@@ -102,6 +102,16 @@
                     "weather_record_pre_window_seconds":  120,
                     "weather_record_receive_window_seconds":  300,
                     "tgftp_window_max_inflight_per_station":  10
+                    ,"model_awc_enabled": true
+                    ,"model_awc_model_path": "models\\lightgbm_rolling_6y_holdout_20260623_171740\\lightgbm_metar_high_rolling_6y_best.pkl"
+                    ,"model_awc_live_station": "KAUS"
+                    ,"model_awc_buy_start_hour": 12
+                    ,"model_awc_buy_end_hour": 18
+                    ,"model_awc_metar_lookback_hours": 8
+                    ,"model_awc_lag_tolerance_minutes": 30
+                    ,"model_awc_poll_delay_seconds": 180
+                    ,"model_awc_poll_interval_seconds": 60
+                    ,"model_awc_poll_attempts": 5
                 },
     "scheduler":  {
                       "poll_interval_minutes":  15,
@@ -142,7 +152,7 @@
                           "telegram_notify_order_filled":  true
                       },
     "price_momentum":  {
-                           "enabled":  true,
+                           "enabled":  false,
                            "awc_extreme_harvest_enabled":  false,
                            "move_to_one_fraction":  0.3,
                            "no_change_pct":  0.3,
@@ -167,7 +177,7 @@
                        },
     "strategies":  [
                        {
-                           "name":  "deterministic_harvest",
+                           "name":  "model_awc_high",
                            "enabled":  true,
                            "events":  {
                                           "target_dates":  [
@@ -175,8 +185,8 @@
                                                            ]
                                       },
                            "trading":  {
-                                           "strategy_name":  "deterministic_harvest",
-                                           "strategy_mode":  "deterministic_harvest",
+                                           "strategy_name":  "model_awc_high",
+                                           "strategy_mode":  "model_awc_high",
                                            "buy_notional_usdc":  5,
                                            "fee_rate":  0.05,
                                            "fee_enabled":  true,
@@ -216,6 +226,16 @@
                                            "weather_record_pre_window_seconds":  120,
                                            "weather_record_receive_window_seconds":  300,
                                            "tgftp_window_max_inflight_per_station":  10
+                                           ,"model_awc_enabled": true
+                                           ,"model_awc_model_path": "models\\lightgbm_rolling_6y_holdout_20260623_171740\\lightgbm_metar_high_rolling_6y_best.pkl"
+                                           ,"model_awc_live_station": "KAUS"
+                                           ,"model_awc_buy_start_hour": 12
+                                           ,"model_awc_buy_end_hour": 18
+                                           ,"model_awc_metar_lookback_hours": 8
+                                           ,"model_awc_lag_tolerance_minutes": 30
+                                           ,"model_awc_poll_delay_seconds": 180
+                                           ,"model_awc_poll_interval_seconds": 60
+                                           ,"model_awc_poll_attempts": 5
                                        }
                        }
                    ]
