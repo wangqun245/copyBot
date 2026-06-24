@@ -5857,10 +5857,15 @@ def start_aviation_thread(config: dict[str, Any]) -> threading.Thread:
 
 def model_awc_supervisor(config: dict[str, Any]) -> None:
     """Poll AWC METAR after expected observation windows and trade model predictions."""
-    if not model_awc_enabled(config):
-        LOGGER.info("model awc supervisor disabled")
+    try:
+        if not model_awc_enabled(config):
+            LOGGER.info("model awc supervisor disabled")
+            return
+        model_awc_load_model(config)
+    except Exception:
+        LOGGER.exception("model awc supervisor failed during startup")
         return
-    model_awc_load_model(config)
+
     fallback_poll_seconds = max(10, int(config["trading"].get("aviation_poll_interval_seconds", 60)))
     poll_delay_seconds = max(0, int(config["trading"].get("model_awc_poll_delay_seconds", 180)))
     poll_interval_seconds = max(10, int(config["trading"].get("model_awc_poll_interval_seconds", 60)))
@@ -6019,6 +6024,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
 
 def start_model_awc_thread(config: dict[str, Any]) -> threading.Thread:
     """Start the AWC METAR model strategy in a daemon thread."""
+    LOGGER.info("model awc thread starting")
     thread = threading.Thread(target=model_awc_supervisor, args=(config,), name="model-awc-high", daemon=True)
     thread.start()
     return thread
