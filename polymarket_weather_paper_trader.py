@@ -340,7 +340,22 @@ def default_config() -> dict[str, Any]:
         "model_awc_live_station": "KAUS",
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 18,
-        "model_awc_metar_lookback_hours": 8,
+        "model_awc_metar_lookback_hours": 7,
+        "model_awc_observation_minute": 53,
+        "model_awc_station_observation_minutes": {
+            "KORD": 53,
+            "KATL": 54,
+            "KLGA": 54,
+            "KSFO": 59,
+            "KBKF": 0,
+            "KAUS": 56,
+            "KDAL": 56,
+            "KHOU": 56,
+            "KSEA": 56,
+            "KDEN": 56,
+            "KMIA": 56,
+        },
+        "model_awc_station_poll_stagger_seconds": 5,
         "model_awc_lag_tolerance_minutes": 30,
         "model_awc_poll_delay_seconds": 180,
         "model_awc_poll_interval_seconds": 60,
@@ -2030,6 +2045,42 @@ def model_awc_parse_row(row: dict[str, Any], station: str) -> Optional[FeatureMe
         valid_text=obs_dt.strftime("%Y-%m-%d %H:%M"),
         metar=raw_metar,
     )
+
+
+def model_awc_station_observation_minute(config: dict[str, Any], station: str) -> int:
+    """Return the configured hourly METAR observation minute for a station."""
+    station = station.upper()
+    fallback = int(config["trading"].get("model_awc_observation_minute", 53))
+    station_minutes = config["trading"].get("model_awc_station_observation_minutes", {})
+    if isinstance(station_minutes, dict):
+        try:
+            return min(59, max(0, int(station_minutes.get(station, fallback))))
+        except (TypeError, ValueError):
+            return min(59, max(0, fallback))
+    return min(59, max(0, fallback))
+
+
+def model_awc_station_stagger_seconds(config: dict[str, Any], station: str) -> int:
+    """Stagger stations sharing the same observation minute to reduce API bursts."""
+    station = station.upper()
+    station_minutes = config["trading"].get("model_awc_station_observation_minutes", {})
+    if not isinstance(station_minutes, dict) or station not in station_minutes:
+        return 0
+    try:
+        minute = int(station_minutes[station])
+    except (TypeError, ValueError):
+        return 0
+    same_minute = []
+    for candidate, candidate_minute in station_minutes.items():
+        try:
+            if int(candidate_minute) == minute:
+                same_minute.append(str(candidate).upper())
+        except (TypeError, ValueError):
+            continue
+    if station not in same_minute:
+        return 0
+    stagger = max(0, int(config["trading"].get("model_awc_station_poll_stagger_seconds", 5)))
+    return same_minute.index(station) * stagger
 
 
 def model_awc_feature_row(
@@ -5814,20 +5865,24 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
     poll_delay_seconds = max(0, int(config["trading"].get("model_awc_poll_delay_seconds", 180)))
     poll_interval_seconds = max(10, int(config["trading"].get("model_awc_poll_interval_seconds", 60)))
     poll_attempts = max(1, int(config["trading"].get("model_awc_poll_attempts", 5)))
-    lookback_hours = max(4, int(config["trading"].get("model_awc_metar_lookback_hours", 8)))
+    lookback_hours = max(7, int(config["trading"].get("model_awc_metar_lookback_hours", 7)))
+    start_hour = int(config["trading"].get("model_awc_buy_start_hour", 12))
+    end_hour = int(config["trading"].get("model_awc_buy_end_hour", 18))
     event_cache: list[dict[str, Any]] = []
     station_groups: dict[tuple[str, str], dict[str, Any]] = {}
-    station_timing: dict[tuple[str, str], dict[str, Any]] = {}
     window_state: dict[str, dict[str, Any]] = {}
     event_refresh_at = 0.0
-    timing_refresh_at = 0.0
     LOGGER.info(
-        "model awc supervisor started live_station=%s poll_delay_seconds=%s poll_interval_seconds=%s poll_attempts=%s lookback_hours=%s",
+        "model awc supervisor started live_station=%s local_hours=%s-%s poll_delay_seconds=%s poll_interval_seconds=%s poll_attempts_per_window=%s lookback_hours=%s station_observation_minutes=%s station_stagger_seconds=%s",
         model_awc_live_station(config),
+        start_hour,
+        end_hour,
         poll_delay_seconds,
         poll_interval_seconds,
         poll_attempts,
         lookback_hours,
+        config["trading"].get("model_awc_station_observation_minutes", {}),
+        config["trading"].get("model_awc_station_poll_stagger_seconds", 5),
     )
     while True:
         try:
@@ -5855,86 +5910,102 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
                     group = station_groups.setdefault(group_key, {"city": city, "station": station, "events": []})
                     group["events"].append(event)
                 event_refresh_at = now_mono + 300
-                timing_refresh_at = 0.0
                 LOGGER.info("model awc event cache refreshed highest_events=%s station_groups=%s", len(event_cache), len(station_groups))
-
-            if now_mono >= timing_refresh_at:
-                for group_key, group in station_groups.items():
-                    city = str(group["city"])
-                    station = str(group["station"])
-                    try:
-                        latest_dt, interval_seconds, report_count, scheduled_minutes, expected_next_dt = aviation_report_timing(station, 24, config)
-                        if latest_dt is None or expected_next_dt is None:
-                            continue
-                        station_timing[group_key] = update_station_report_timing(
-                            city,
-                            station,
-                            latest_dt,
-                            max(60, int(interval_seconds or 3600)),
-                            report_count,
-                            scheduled_minutes,
-                            expected_next_dt,
-                        )
-                    except Exception:
-                        LOGGER.exception("model awc timing refresh failed city=%s station=%s", city, station)
-                timing_refresh_at = now_mono + 60
 
             for group_key, group in station_groups.items():
                 city = str(group["city"])
                 station = str(group["station"])
-                timing = station_timing.get(group_key)
-                if not timing:
-                    continue
-                obs_dt = parse_optional_utc_datetime(timing.get("latest_obs_utc"))
-                if obs_dt is None:
-                    continue
-                window_key = f"{city}:{station}:{obs_dt.isoformat()}:model_awc"
-                state = window_state.setdefault(window_key, {"attempts": 0, "next_poll_at": obs_dt.timestamp() + poll_delay_seconds, "done": False})
-                if state.get("done"):
-                    continue
-                if int(state.get("attempts", 0)) >= poll_attempts:
-                    state["done"] = True
-                    continue
-                next_poll_dt = datetime.fromtimestamp(float(state.get("next_poll_at", 0.0)), timezone.utc)
-                if now_utc < next_poll_dt:
-                    continue
+                tz = city_timezone(config, city)
+                now_local = now_utc.astimezone(tz)
+                observation_minute = model_awc_station_observation_minute(config, station)
+                station_stagger_seconds = model_awc_station_stagger_seconds(config, station)
+                events_by_date: dict[str, list[dict[str, Any]]] = {}
+                for event in list(group["events"]):
+                    event_date = str(event.get("_parsed_event_date") or "")
+                    if event_date:
+                        events_by_date.setdefault(event_date, []).append(event)
 
-                state["attempts"] = int(state.get("attempts", 0)) + 1
-                state["next_poll_at"] = (now_utc + timedelta(seconds=poll_interval_seconds)).timestamp()
-                try:
-                    rows = aviation_metar_observations(station, lookback_hours)
-                    append_aviation_metar_history(config, station, rows, "model_awc_prediction")
-                    for event in list(group["events"]):
-                        event_date = str(event.get("_parsed_event_date") or "")
-                        built = model_awc_feature_row(config, city, station, rows, event_date)
-                        if built is None:
+                for event_date, events_for_date in events_by_date.items():
+                    try:
+                        target_date = date.fromisoformat(event_date)
+                    except ValueError:
+                        continue
+                    if now_local.date() != target_date:
+                        continue
+                    for local_hour in range(start_hour, end_hour + 1):
+                        expected_local = datetime(
+                            target_date.year,
+                            target_date.month,
+                            target_date.day,
+                            local_hour,
+                            observation_minute,
+                            tzinfo=tz,
+                        )
+                        expected_utc = expected_local.astimezone(timezone.utc)
+                        poll_start_utc = expected_utc + timedelta(seconds=poll_delay_seconds + station_stagger_seconds)
+                        poll_end_utc = poll_start_utc + timedelta(seconds=poll_interval_seconds * poll_attempts)
+                        if now_utc < poll_start_utc:
                             continue
-                        features, latest_row, latest_local = built
-                        if latest_row.valid_utc < obs_dt - timedelta(minutes=10):
+                        window_key = f"{city}:{station}:{event_date}:hour_{local_hour:02d}:model_awc"
+                        state = window_state.setdefault(
+                            window_key,
+                            {
+                                "attempts": 0,
+                                "next_poll_at": poll_start_utc.timestamp(),
+                                "done": False,
+                                "expected_obs_utc": expected_utc.isoformat(),
+                            },
+                        )
+                        if state.get("done"):
+                            continue
+                        if int(state.get("attempts", 0)) >= poll_attempts or now_utc > poll_end_utc:
+                            state["done"] = True
+                            continue
+                        next_poll_dt = datetime.fromtimestamp(float(state.get("next_poll_at", 0.0)), timezone.utc)
+                        if now_utc < next_poll_dt:
+                            continue
+
+                        state["attempts"] = int(state.get("attempts", 0)) + 1
+                        state["next_poll_at"] = (now_utc + timedelta(seconds=poll_interval_seconds)).timestamp()
+                        try:
+                            rows = aviation_metar_observations(station, lookback_hours)
+                            append_aviation_metar_history(config, station, rows, "model_awc_prediction")
+                            got_latest_metar = False
+                            for event in events_for_date:
+                                built = model_awc_feature_row(config, city, station, rows, event_date)
+                                if built is None:
+                                    continue
+                                features, latest_row, latest_local = built
+                                if latest_local.hour != local_hour or latest_row.valid_utc < expected_utc - timedelta(minutes=10):
+                                    LOGGER.info(
+                                        "model awc latest metar not current window city=%s station=%s latest=%s latest_local=%s expected=%s attempt=%s",
+                                        city,
+                                        station,
+                                        latest_row.valid_utc.isoformat(),
+                                        latest_local.isoformat(),
+                                        expected_utc.isoformat(),
+                                        state["attempts"],
+                                    )
+                                    continue
+                                got_latest_metar = True
+                                predicted_high_f = model_awc_predict_high(config, features)
+                                process_model_awc_prediction(config, event, city, station, predicted_high_f, latest_row, latest_local)
+                            if got_latest_metar:
+                                state["done"] = True
                             LOGGER.info(
-                                "model awc latest metar before expected city=%s station=%s latest=%s expected=%s attempt=%s",
+                                "model awc poll city=%s station=%s event_date=%s local_hour=%s expected=%s attempts=%s done=%s got_latest_metar=%s rows=%s",
                                 city,
                                 station,
-                                latest_row.valid_utc.isoformat(),
-                                obs_dt.isoformat(),
+                                event_date,
+                                local_hour,
+                                expected_utc.isoformat(),
                                 state["attempts"],
+                                state.get("done"),
+                                got_latest_metar,
+                                len(rows),
                             )
-                            continue
-                        predicted_high_f = model_awc_predict_high(config, features)
-                        trade = process_model_awc_prediction(config, event, city, station, predicted_high_f, latest_row, latest_local)
-                        if trade:
-                            state["done"] = True
-                    LOGGER.info(
-                        "model awc poll city=%s station=%s expected=%s attempts=%s done=%s rows=%s",
-                        city,
-                        station,
-                        obs_dt.isoformat(),
-                        state["attempts"],
-                        state.get("done"),
-                        len(rows),
-                    )
-                except Exception:
-                    LOGGER.exception("model awc poll failed city=%s station=%s obs=%s", city, station, obs_dt.isoformat())
+                        except Exception:
+                            LOGGER.exception("model awc poll failed city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
 
             active_prefixes = {f"{group['city']}:{group['station']}:" for group in station_groups.values()}
             for key in list(window_state):

@@ -107,7 +107,22 @@
                     ,"model_awc_live_station": "KAUS"
                     ,"model_awc_buy_start_hour": 12
                     ,"model_awc_buy_end_hour": 18
-                    ,"model_awc_metar_lookback_hours": 8
+                    ,"model_awc_metar_lookback_hours": 7
+                    ,"model_awc_observation_minute": 53
+                    ,"model_awc_station_observation_minutes": {
+                        "KORD": 53,
+                        "KATL": 54,
+                        "KLGA": 54,
+                        "KSFO": 59,
+                        "KBKF": 0,
+                        "KAUS": 56,
+                        "KDAL": 56,
+                        "KHOU": 56,
+                        "KSEA": 56,
+                        "KDEN": 56,
+                        "KMIA": 56
+                    }
+                    ,"model_awc_station_poll_stagger_seconds": 5
                     ,"model_awc_lag_tolerance_minutes": 30
                     ,"model_awc_poll_delay_seconds": 180
                     ,"model_awc_poll_interval_seconds": 60
@@ -231,7 +246,22 @@
                                            ,"model_awc_live_station": "KAUS"
                                            ,"model_awc_buy_start_hour": 12
                                            ,"model_awc_buy_end_hour": 18
-                                           ,"model_awc_metar_lookback_hours": 8
+                                           ,"model_awc_metar_lookback_hours": 7
+                                           ,"model_awc_observation_minute": 53
+                                           ,"model_awc_station_observation_minutes": {
+                                               "KORD": 53,
+                                               "KATL": 54,
+                                               "KLGA": 54,
+                                               "KSFO": 59,
+                                               "KBKF": 0,
+                                               "KAUS": 56,
+                                               "KDAL": 56,
+                                               "KHOU": 56,
+                                               "KSEA": 56,
+                                               "KDEN": 56,
+                                               "KMIA": 56
+                                           }
+                                           ,"model_awc_station_poll_stagger_seconds": 5
                                            ,"model_awc_lag_tolerance_minutes": 30
                                            ,"model_awc_poll_delay_seconds": 180
                                            ,"model_awc_poll_interval_seconds": 60
