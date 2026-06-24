@@ -2881,6 +2881,7 @@ def notify_trade(config: dict[str, Any], trade: PaperTrade, action: str, status:
         return
     notifier = get_telegram_notifier(config)
     if not notifier:
+        LOGGER.warning("telegram trade notification skipped notifier unavailable trade=%s action=%s status=%s", trade.trade_id, action, status)
         return
 
     action = action.upper()
