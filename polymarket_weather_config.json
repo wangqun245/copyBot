@@ -157,7 +157,7 @@
                     "safe_address_env":  "SAFE_ADDRESS",
                     "funder_address_env":  "FUNDER_ADDRESS",
                     "signature_type_env":  "SIGNATURE_TYPE",
-                    "signature_type":  3,
+                    "signature_type":  2,
                     "sync_positions_on_start":  true,
                     "sync_positions_on_stop":  true
                 },

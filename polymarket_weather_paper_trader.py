@@ -400,7 +400,7 @@ def default_config() -> dict[str, Any]:
             "safe_address_env": "SAFE_ADDRESS",
             "funder_address_env": "FUNDER_ADDRESS",
             "signature_type_env": "SIGNATURE_TYPE",
-            "signature_type": 3,
+            "signature_type": 2,
             "sync_positions_on_start": True,
             "sync_positions_on_stop": True,
         },
@@ -2166,16 +2166,35 @@ def model_awc_market_candidate(
     market: TemperatureMarket,
     predicted_high_f: float,
     event_unit: str,
+    predicted_yes_market_id: str,
 ) -> Optional[dict[str, Any]]:
     """Return the YES/NO side and executable price implied by one market range."""
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
     if predicted is None:
         return None
-    side = "YES" if market_contains_temperature(market, float(predicted), event_unit) else "NO"
+    side = "YES" if market.market_id == predicted_yes_market_id else "NO"
     price = best_buy_price(config, market, side)
     if price is None or price <= 0:
         return None
     return {"market": market, "side": side, "price": float(price)}
+
+
+def model_awc_predicted_yes_market(
+    markets: list[TemperatureMarket],
+    predicted_high_f: float,
+    event_unit: str,
+) -> Optional[TemperatureMarket]:
+    """Return the unique market interval that contains the model high prediction."""
+    predicted = convert_temperature(predicted_high_f, "F", event_unit)
+    if predicted is None:
+        return None
+    matches = []
+    for market in markets:
+        if market_contains_temperature(market, float(predicted), event_unit):
+            matches.append(market)
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def process_model_awc_prediction(
@@ -2207,9 +2226,21 @@ def process_model_awc_prediction(
         LOGGER.info("model awc skip no highest markets city=%s station=%s event_date=%s", city, station, event_date)
         return None
     event_unit = event_market_unit(markets)
+    predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
+    if predicted_yes_market is None:
+        LOGGER.info(
+            "model awc skip invalid prediction outside unique market interval city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f event_unit=%s",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            event_unit,
+        )
+        return None
     candidates = []
     for market in markets:
-        candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit)
+        candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit, predicted_yes_market.market_id)
         if candidate:
             candidates.append(candidate)
     if not candidates:
@@ -2221,7 +2252,7 @@ def process_model_awc_prediction(
     side = str(selected["side"])
     price = float(selected["price"])
     cycle_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
-    reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_local_hour_{local_hour:02d}"
+    reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
     live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() == model_awc_live_station(config) else None
     trade = (
         live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason)
@@ -2962,8 +2993,8 @@ class LiveTradingManager:
         safe_address = _account_env(self.config, "safe_address_env")
         funder_address = _account_env(self.config, "funder_address_env")
         signature_type_env = str(self.config.get("account", {}).get("signature_type_env") or "SIGNATURE_TYPE").strip()
-        signature_type_raw = os.getenv(signature_type_env, str(self.config.get("account", {}).get("signature_type", 3))).strip() if signature_type_env else str(self.config.get("account", {}).get("signature_type", 3)).strip()
-        signature_type = int(signature_type_raw or "3")
+        signature_type_raw = os.getenv(signature_type_env, str(self.config.get("account", {}).get("signature_type", 2))).strip() if signature_type_env else str(self.config.get("account", {}).get("signature_type", 2)).strip()
+        signature_type = int(signature_type_raw or "2")
         dry_run = bool(self.config.get("trading", {}).get("live_trading_dry_run", False))
         from executor import Executor
         from polymarket_ws import PolymarketUserFeed
@@ -2974,6 +3005,13 @@ class LiveTradingManager:
             dry_run=dry_run,
             signature_type=signature_type,
             funder_address=funder_address,
+        )
+        LOGGER.info(
+            "live trading executor starting dry_run=%s signature_type=%s safe_configured=%s funder_configured=%s",
+            dry_run,
+            signature_type,
+            bool(safe_address),
+            bool(funder_address),
         )
         if not self.executor.initialize():
             raise RuntimeError("executor.initialize() failed; live trading is not available")
