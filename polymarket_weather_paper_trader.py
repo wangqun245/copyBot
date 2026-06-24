@@ -336,7 +336,7 @@ def default_config() -> dict[str, Any]:
         "depth_price_notional_multiplier": 2.0,
         "depth_price_extra_levels": 1,
         "model_awc_enabled": True,
-        "model_awc_model_path": r"models\lightgbm_rolling_6y_holdout_20260623_171740\lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_model_path": r"models\lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608\lightgbm_metar_high_rolling_6y_best.pkl",
         "model_awc_live_station": "KAUS",
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 18,
@@ -2001,6 +2001,19 @@ def model_awc_load_model(config: dict[str, Any]) -> Any:
     return MODEL_AWC_MODEL
 
 
+def model_awc_required_lag_hours(config: dict[str, Any]) -> int:
+    """Return the largest hourly temperature lag required by the loaded model."""
+    model = model_awc_load_model(config)
+    feature_names = list(getattr(model, "feature_name_", []))
+    lag_hours = [
+        int(match.group(1))
+        for name in feature_names
+        for match in [re.fullmatch(r"temp_f_lag_(\d+)h", str(name))]
+        if match
+    ]
+    return max(lag_hours, default=3)
+
+
 def model_awc_parse_row(row: dict[str, Any], station: str) -> Optional[FeatureMetarRow]:
     """Convert one AviationWeather JSON row into the feature pipeline row shape."""
     raw_metar = str(row.get("rawOb") or row.get("raw") or row.get("metar") or "").strip()
@@ -2057,7 +2070,7 @@ def model_awc_feature_row(
     temp_values = [decode_metar(item, station, tz).get("temp_f") for item in parsed]
     tolerance = timedelta(minutes=int(config["trading"].get("model_awc_lag_tolerance_minutes", 30)))
     current_temp = features.get("temp_f")
-    for hours in (1, 2, 3):
+    for hours in range(1, model_awc_required_lag_hours(config) + 1):
         lag_value = nearest_lag_value(latest.valid_utc - timedelta(hours=hours), valid_times, temp_values, tolerance)
         features[f"temp_f_lag_{hours}h"] = lag_value
         features[f"temp_f_change_{hours}h"] = (
