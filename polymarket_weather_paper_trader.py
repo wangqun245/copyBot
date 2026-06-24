@@ -336,7 +336,7 @@ def default_config() -> dict[str, Any]:
         "depth_price_notional_multiplier": 2.0,
         "depth_price_extra_levels": 1,
         "model_awc_enabled": True,
-        "model_awc_model_path": r"models\lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608\lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl",
         "model_awc_live_station": "KAUS",
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 18,
@@ -2008,6 +2008,8 @@ def model_awc_load_model(config: dict[str, Any]) -> Any:
     path = str(config.get("trading", {}).get("model_awc_model_path") or "").strip()
     if not path:
         raise RuntimeError("trading.model_awc_model_path is required")
+    if os.sep == "/" and "\\" in path:
+        path = path.replace("\\", "/")
     abs_path = os.path.abspath(path)
     if MODEL_AWC_MODEL is None or MODEL_AWC_MODEL_PATH != abs_path:
         MODEL_AWC_MODEL = joblib.load(abs_path)
