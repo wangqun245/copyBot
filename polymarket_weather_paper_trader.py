@@ -337,7 +337,7 @@ def default_config() -> dict[str, Any]:
         "depth_price_extra_levels": 1,
         "model_awc_enabled": True,
         "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl",
-        "model_awc_live_station": "KAUS",
+        "model_awc_live_stations": ["KAUS", "KSEA"],
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 18,
         "model_awc_metar_lookback_hours": 7,
@@ -2016,9 +2016,23 @@ def model_awc_enabled(config: dict[str, Any]) -> bool:
     return bool(config.get("trading", {}).get("model_awc_enabled", True))
 
 
+def model_awc_live_stations(config: dict[str, Any]) -> set[str]:
+    """Return stations allowed to place real live orders."""
+    trading = config.get("trading", {})
+    raw_stations = trading.get("model_awc_live_stations", trading.get("model_awc_live_station", "KAUS"))
+    if isinstance(raw_stations, str):
+        stations = [part.strip() for part in raw_stations.split(",")]
+    elif isinstance(raw_stations, (list, tuple, set)):
+        stations = [str(part).strip() for part in raw_stations]
+    else:
+        stations = ["KAUS"]
+    return {station.upper() for station in stations if station}
+
+
 def model_awc_live_station(config: dict[str, Any]) -> str:
-    """Return the one station allowed to place real live orders."""
-    return str(config.get("trading", {}).get("model_awc_live_station", "KAUS")).upper()
+    """Return a display value for model AWC live stations."""
+    stations = sorted(model_awc_live_stations(config))
+    return ",".join(stations) if stations else "KAUS"
 
 
 def model_awc_load_model(config: dict[str, Any]) -> Any:
@@ -2276,7 +2290,7 @@ def process_model_awc_prediction(
         LOGGER.info("model awc skip no highest markets city=%s station=%s event_date=%s", city, station, event_date)
         return None
     event_unit = event_market_unit(markets)
-    live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() == model_awc_live_station(config) else None
+    live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() in model_awc_live_stations(config) else None
 
     def submit_model_awc_trade(
         market: TemperatureMarket,
