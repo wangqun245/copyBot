@@ -230,10 +230,10 @@ def _signature_type(value: int) -> SignatureTypeV2:
         return SignatureTypeV2.EOA
 
 
-def _order_options() -> PartialCreateOrderOptions:
+def _order_options(neg_risk: bool = DEFAULT_NEG_RISK) -> PartialCreateOrderOptions:
     return PartialCreateOrderOptions(
         tick_size=DEFAULT_TICK_SIZE,
-        neg_risk=DEFAULT_NEG_RISK,
+        neg_risk=bool(neg_risk),
     )
 
 
@@ -606,7 +606,7 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-    def place_buy_order(self, token_id: str, amount_usd: float, price: float = 0.0) -> OrderResult:
+    def place_buy_order(self, token_id: str, amount_usd: float, price: float = 0.0, neg_risk: bool = DEFAULT_NEG_RISK) -> OrderResult:
         """Post a buy order and return immediately; caller verifies/cancels later."""
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
@@ -673,7 +673,7 @@ class Executor:
                     size=float(int(shares)),
                     side="BUY",
                 ),
-                options=_order_options(),
+                options=_order_options(neg_risk),
                 order_type=OrderType.GTC,
             )
             order_id = result.get("orderID", "")
@@ -751,7 +751,7 @@ class Executor:
             dry_run=False,
         )
 
-    def place_sell_order(self, token_id: str, shares: float, price: float = 0.0) -> OrderResult:
+    def place_sell_order(self, token_id: str, shares: float, price: float = 0.0, neg_risk: bool = DEFAULT_NEG_RISK) -> OrderResult:
         """Post a sell order and return immediately; caller verifies/cancels later."""
         sell_shares = int(shares)
         if sell_shares < 1:
@@ -833,7 +833,7 @@ class Executor:
                     price=market_price,
                     order_type=OrderType.GTC,
                 ),
-                options=_order_options(),
+                options=_order_options(neg_risk),
                 order_type=OrderType.GTC,
             )
             order_id = result.get("orderID", "")

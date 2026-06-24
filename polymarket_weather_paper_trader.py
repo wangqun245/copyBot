@@ -360,6 +360,8 @@ def default_config() -> dict[str, Any]:
         "model_awc_poll_delay_seconds": 180,
         "model_awc_poll_interval_seconds": 60,
         "model_awc_poll_attempts": 5,
+        "model_awc_adjacent_yes_max_total_price": 0.9,
+        "model_awc_adjacent_yes_shares": 10,
     }
     return {
     "api": {
@@ -400,7 +402,7 @@ def default_config() -> dict[str, Any]:
             "safe_address_env": "SAFE_ADDRESS",
             "funder_address_env": "FUNDER_ADDRESS",
             "signature_type_env": "SIGNATURE_TYPE",
-            "signature_type": 2,
+            "signature_type": 3,
             "sync_positions_on_start": True,
             "sync_positions_on_stop": True,
         },
@@ -1257,6 +1259,23 @@ def asset_id_for_market_side(market: TemperatureMarket, side: str) -> str:
         if outcome.strip().lower() == wanted:
             return asset_id
     return ""
+
+
+def market_neg_risk(market: TemperatureMarket) -> bool:
+    """Return whether a Polymarket market requires neg-risk order signing."""
+    raw = parse_jsonish(market.raw_market_json, {})
+    if not isinstance(raw, dict):
+        return False
+    for key in ("negRisk", "neg_risk", "negativeRisk", "negative_risk"):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes"}
+        return bool(value)
+    return False
 
 
 def parse_clob_levels(levels: Any) -> list[tuple[float, float]]:
@@ -2197,6 +2216,37 @@ def model_awc_predicted_yes_market(
     return matches[0]
 
 
+def model_awc_adjacent_prediction_markets(
+    markets: list[TemperatureMarket],
+    predicted_high_f: float,
+    event_unit: str,
+) -> Optional[tuple[TemperatureMarket, TemperatureMarket]]:
+    """Return two adjacent markets around an imprecise model high prediction."""
+    predicted = convert_temperature(predicted_high_f, "F", event_unit)
+    if predicted is None:
+        return None
+    matched = [market for market in markets if market_contains_temperature(market, float(predicted), event_unit)]
+    if len(matched) == 2:
+        ordered = sorted_markets_for_unit(matched, event_unit)
+        return ordered[0], ordered[1]
+    if matched:
+        return None
+
+    lower_candidates: list[tuple[float, TemperatureMarket]] = []
+    upper_candidates: list[tuple[float, TemperatureMarket]] = []
+    for market in markets:
+        lo, hi, _ = comparable_rule_bounds(market, event_unit)
+        if hi is not None and hi < float(predicted):
+            lower_candidates.append((hi, market))
+        if lo is not None and lo > float(predicted):
+            upper_candidates.append((lo, market))
+    if not lower_candidates or not upper_candidates:
+        return None
+    lower = max(lower_candidates, key=lambda item: item[0])[1]
+    upper = min(upper_candidates, key=lambda item: item[0])[1]
+    return lower, upper
+
+
 def process_model_awc_prediction(
     config: dict[str, Any],
     event: dict[str, Any],
@@ -2226,10 +2276,73 @@ def process_model_awc_prediction(
         LOGGER.info("model awc skip no highest markets city=%s station=%s event_date=%s", city, station, event_date)
         return None
     event_unit = event_market_unit(markets)
-    predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
-    if predicted_yes_market is None:
+    live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() == model_awc_live_station(config) else None
+
+    def submit_model_awc_trade(
+        market: TemperatureMarket,
+        side: str,
+        price: float,
+        reason: str,
+        amount_usd: Optional[float] = None,
+    ) -> Optional[PaperTrade]:
+        cycle_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
+        trade = (
+            live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, amount_usd=amount_usd)
+            if live_trader
+            else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, notional_usdc=amount_usd)
+        )
+        if not trade:
+            return None
+        trade.forecast_source = f"model_awc_high_lightgbm:{MODEL_AWC_MODEL_PATH or config['trading'].get('model_awc_model_path', '')}"
+        trade.forecast_observed_at = latest_row.valid_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
+        trade.forecast_first_valid_time_local = latest_local.isoformat(timespec="seconds")
+        trade.forecast_last_valid_time_local = latest_local.isoformat(timespec="seconds")
+        if not live_trader:
+            trade.execution_mode = "DRY_RUN"
+            notify_trade(config, trade, "BUY", "FILLED", reason)
+        trades.append(trade)
+        write_csv(config["outputs"]["trades_csv"], trades)
+        write_csv(config["outputs"]["settled_trades_csv"], trades)
+        write_performance_reports(config, trades)
         LOGGER.info(
-            "model awc skip invalid prediction outside unique market interval city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f event_unit=%s",
+            "model awc buy city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f side=%s market=%s price=%s amount_usd=%s shares=%s live=%s question=%r",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            side,
+            market.market_id,
+            price,
+            amount_usd,
+            trade.shares,
+            bool(live_trader),
+            market.market_question,
+        )
+        return trade
+
+    predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
+    if predicted_yes_market is not None:
+        candidates = []
+        for market in markets:
+            candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit, predicted_yes_market.market_id)
+            if candidate:
+                candidates.append(candidate)
+        if not candidates:
+            LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%.2f", city, station, predicted_high_f)
+            return None
+        candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
+        selected = candidates[0]
+        market = selected["market"]
+        side = str(selected["side"])
+        price = round(float(selected["price"]), 2)
+        reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
+        return submit_model_awc_trade(market, side, price, reason)
+
+    adjacent_markets = model_awc_adjacent_prediction_markets(markets, predicted_high_f, event_unit)
+    if adjacent_markets is None:
+        LOGGER.info(
+            "model awc skip invalid prediction without adjacent market pair city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f event_unit=%s",
             city,
             station,
             event_date,
@@ -2238,54 +2351,72 @@ def process_model_awc_prediction(
             event_unit,
         )
         return None
-    candidates = []
-    for market in markets:
-        candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit, predicted_yes_market.market_id)
-        if candidate:
-            candidates.append(candidate)
-    if not candidates:
-        LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%.2f", city, station, predicted_high_f)
+
+    adjacent_prices: list[tuple[TemperatureMarket, float]] = []
+    for market in adjacent_markets:
+        yes_price = best_buy_price(config, market, "YES")
+        if yes_price is None or yes_price <= 0:
+            LOGGER.info(
+                "model awc skip adjacent missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f market=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                market.market_id,
+            )
+            return None
+        adjacent_prices.append((market, round(float(yes_price), 2)))
+    total_yes_price = sum(price for _market, price in adjacent_prices)
+    max_total_price = float(config["trading"].get("model_awc_adjacent_yes_max_total_price", 0.9))
+    adjacent_shares = float(config["trading"].get("model_awc_adjacent_yes_shares", 10))
+    if total_yes_price >= max_total_price:
+        LOGGER.info(
+            "model awc skip adjacent yes total too high city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f max=%.4f markets=%s",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            total_yes_price,
+            max_total_price,
+            [market.market_id for market, _price in adjacent_prices],
+        )
         return None
-    candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
-    selected = candidates[0]
-    market = selected["market"]
-    side = str(selected["side"])
-    price = float(selected["price"])
-    cycle_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
-    reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
-    live_trader = get_live_trader() if live_trading_enabled(config) and station.upper() == model_awc_live_station(config) else None
-    trade = (
-        live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason)
-        if live_trader
-        else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason)
-    )
-    if not trade:
-        return None
-    trade.forecast_source = f"model_awc_high_lightgbm:{MODEL_AWC_MODEL_PATH or config['trading'].get('model_awc_model_path', '')}"
-    trade.forecast_observed_at = latest_row.valid_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
-    trade.forecast_first_valid_time_local = latest_local.isoformat(timespec="seconds")
-    trade.forecast_last_valid_time_local = latest_local.isoformat(timespec="seconds")
-    if not live_trader:
-        trade.execution_mode = "DRY_RUN"
-        notify_trade(config, trade, "BUY", "FILLED", reason)
-    trades.append(trade)
-    write_csv(config["outputs"]["trades_csv"], trades)
-    write_csv(config["outputs"]["settled_trades_csv"], trades)
-    write_performance_reports(config, trades)
+
+    created: list[PaperTrade] = []
+    adjacent_market_ids = "_".join(market.market_id for market, _price in adjacent_prices)
+    for market, price in adjacent_prices:
+        amount_usd = round(adjacent_shares * round(price, 2), 2)
+        reason = (
+            f"model_awc_high_predicted_{predicted_high_f:.2f}_adjacent_yes_{adjacent_market_ids}"
+            f"_shares_{adjacent_shares:g}_total_yes_{total_yes_price:.2f}_local_hour_{local_hour:02d}"
+        )
+        trade = submit_model_awc_trade(market, "YES", price, reason, amount_usd=amount_usd)
+        if trade:
+            created.append(trade)
+    if len(created) != len(adjacent_prices):
+        LOGGER.warning(
+            "model awc adjacent buy partially completed city=%s station=%s event_date=%s local_hour=%s created=%s expected=%s",
+            city,
+            station,
+            event_date,
+            local_hour,
+            len(created),
+            len(adjacent_prices),
+        )
     LOGGER.info(
-        "model awc buy city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f side=%s market=%s price=%s live=%s question=%r",
+        "model awc adjacent buy completed city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f shares_each=%s trades=%s",
         city,
         station,
         event_date,
         local_hour,
         predicted_high_f,
-        side,
-        market.market_id,
-        price,
-        bool(live_trader),
-        market.market_question,
+        total_yes_price,
+        adjacent_shares,
+        [trade.trade_id for trade in created],
     )
-    return trade
+    return created[0] if created else None
 
 
 def parse_weather_record_timestamp(value: Any) -> Optional[datetime]:
@@ -2993,8 +3124,8 @@ class LiveTradingManager:
         safe_address = _account_env(self.config, "safe_address_env")
         funder_address = _account_env(self.config, "funder_address_env")
         signature_type_env = str(self.config.get("account", {}).get("signature_type_env") or "SIGNATURE_TYPE").strip()
-        signature_type_raw = os.getenv(signature_type_env, str(self.config.get("account", {}).get("signature_type", 2))).strip() if signature_type_env else str(self.config.get("account", {}).get("signature_type", 2)).strip()
-        signature_type = int(signature_type_raw or "2")
+        signature_type_raw = os.getenv(signature_type_env, str(self.config.get("account", {}).get("signature_type", 3))).strip() if signature_type_env else str(self.config.get("account", {}).get("signature_type", 3)).strip()
+        signature_type = int(signature_type_raw or "3")
         dry_run = bool(self.config.get("trading", {}).get("live_trading_dry_run", False))
         from executor import Executor
         from polymarket_ws import PolymarketUserFeed
@@ -3038,7 +3169,20 @@ class LiveTradingManager:
         if self._thread:
             self._thread.join(timeout=2)
 
-    def submit_buy_trade(self, config: dict[str, Any], cycle_id: str, market: TemperatureMarket, wu_source: str, station: str, side: str, entry_price: float, observed_high: Optional[float], observed_low: Optional[float], reason: str) -> Optional[PaperTrade]:
+    def submit_buy_trade(
+        self,
+        config: dict[str, Any],
+        cycle_id: str,
+        market: TemperatureMarket,
+        wu_source: str,
+        station: str,
+        side: str,
+        entry_price: float,
+        observed_high: Optional[float],
+        observed_low: Optional[float],
+        reason: str,
+        amount_usd: Optional[float] = None,
+    ) -> Optional[PaperTrade]:
         """Post a live buy order and return a BUY_PENDING trade row when accepted by the CLOB.
         
         Args:
@@ -3062,13 +3206,26 @@ class LiveTradingManager:
         if not token_id:
             LOGGER.warning("live buy skipped missing token side=%s market=%s", side, market.market_id)
             return None
-        amount = float(config["trading"]["buy_notional_usdc"])
-        result = self.executor.place_buy_order(token_id, amount, price=entry_price)
+        amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
+        neg_risk = market_neg_risk(market)
+        result = self.executor.place_buy_order(token_id, amount, price=entry_price, neg_risk=neg_risk)
         if not _result_value(result, "success", False):
-            LOGGER.error("live buy rejected side=%s market=%s price=%s error=%s", side, market.market_id, entry_price, _result_value(result, "error", ""))
+            LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
             return None
 
-        trade = make_trade(config, cycle_id, market, wu_source, station, side, float(_result_value(result, "price", entry_price)), observed_high, observed_low, reason)
+        trade = make_trade(
+            config,
+            cycle_id,
+            market,
+            wu_source,
+            station,
+            side,
+            float(_result_value(result, "price", entry_price)),
+            observed_high,
+            observed_low,
+            reason,
+            notional_usdc=float(_result_value(result, "amount_usd", amount)),
+        )
         self._apply_buy_result_to_trade(trade, result, pending=True)
         self._register_pending(
             LivePendingOrder(
@@ -3084,7 +3241,7 @@ class LiveTradingManager:
                 token_balance_before=_result_value(result, "token_balance_before", None),
             )
         )
-        LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares)
+        LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s neg_risk=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares, neg_risk)
         notify_trade(config, trade, "BUY", "SUBMITTED", reason)
         return trade
 
@@ -3108,7 +3265,8 @@ class LiveTradingManager:
             trade.live_order_error = "missing token id for sell"
             LOGGER.warning("live sell skipped missing token trade=%s market=%s", trade.trade_id, market.market_id)
             return False
-        result = self.executor.place_sell_order(token_id, trade.shares, price=exit_price)
+        neg_risk = market_neg_risk(market)
+        result = self.executor.place_sell_order(token_id, trade.shares, price=exit_price, neg_risk=neg_risk)
         if not _result_value(result, "success", False):
             trade.live_order_status = str(_result_value(result, "status", "FAILED"))
             trade.live_order_error = str(_result_value(result, "error", ""))
@@ -3435,7 +3593,19 @@ class LiveTradingManager:
         LOGGER.info("live order cancelled order=%s kind=%s reason=%s cancelled=%s", pending.order_id, pending.kind, reason, cancelled)
 
 
-def make_trade(config: dict[str, Any], cycle_id: str, market: TemperatureMarket, wu_source: str, station: str, side: str, entry_price: float, observed_high: Optional[float], observed_low: Optional[float], reason: str) -> PaperTrade:
+def make_trade(
+    config: dict[str, Any],
+    cycle_id: str,
+    market: TemperatureMarket,
+    wu_source: str,
+    station: str,
+    side: str,
+    entry_price: float,
+    observed_high: Optional[float],
+    observed_low: Optional[float],
+    reason: str,
+    notional_usdc: Optional[float] = None,
+) -> PaperTrade:
     """Create a PaperTrade record for a deterministic strategy entry.
     
     Args:
@@ -3456,7 +3626,7 @@ def make_trade(config: dict[str, Any], cycle_id: str, market: TemperatureMarket,
     now = datetime.now().isoformat(timespec="seconds")
     side = side.upper()
     price = float(entry_price)
-    notional = float(config["trading"]["buy_notional_usdc"])
+    notional = float(notional_usdc if notional_usdc is not None else config["trading"]["buy_notional_usdc"])
     shares = notional / price if price > 0 else 0.0
     fee = taker_fee_usdc(shares, price, float(config["trading"]["fee_rate"]), bool(config["trading"].get("fee_enabled", True)))
     comparable_min, comparable_max, comparable_unit = comparable_rule_bounds(market, market.unit)
