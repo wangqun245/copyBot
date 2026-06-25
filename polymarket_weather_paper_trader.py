@@ -2408,6 +2408,18 @@ def model_awc_predicted_yes_market(
     return matches[0]
 
 
+def model_awc_prediction_matches(
+    markets: list[TemperatureMarket],
+    predicted_high_f: float,
+    event_unit: str,
+) -> list[TemperatureMarket]:
+    """Return all market intervals containing the model high prediction."""
+    predicted = convert_temperature(predicted_high_f, "F", event_unit)
+    if predicted is None:
+        return []
+    return [market for market in markets if market_contains_temperature(market, float(predicted), event_unit)]
+
+
 def model_awc_adjacent_prediction_markets(
     markets: list[TemperatureMarket],
     predicted_high_f: float,
@@ -2437,6 +2449,27 @@ def model_awc_adjacent_prediction_markets(
     lower = max(lower_candidates, key=lambda item: item[0])[1]
     upper = min(upper_candidates, key=lambda item: item[0])[1]
     return lower, upper
+
+
+def model_awc_best_non_adjacent_no_candidate(
+    config: dict[str, Any],
+    markets: list[TemperatureMarket],
+    adjacent_markets: tuple[TemperatureMarket, TemperatureMarket],
+) -> Optional[dict[str, Any]]:
+    """Return the cheapest NO candidate outside the two adjacent prediction markets."""
+    adjacent_ids = {market.market_id for market in adjacent_markets}
+    candidates: list[dict[str, Any]] = []
+    for market in markets:
+        if market.market_id in adjacent_ids:
+            continue
+        price = best_buy_price(config, market, "NO")
+        if price is None or price <= 0:
+            continue
+        candidates.append({"market": market, "side": "NO", "price": round(float(price), 2)})
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id)))
+    return candidates[0]
 
 
 def process_model_awc_prediction(
@@ -2532,6 +2565,7 @@ def process_model_awc_prediction(
         reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
         return submit_model_awc_trade(market, side, price, reason)
 
+    matched_prediction_markets = model_awc_prediction_matches(markets, predicted_high_f, event_unit)
     adjacent_markets = model_awc_adjacent_prediction_markets(markets, predicted_high_f, event_unit)
     if adjacent_markets is None:
         LOGGER.info(
@@ -2563,9 +2597,36 @@ def process_model_awc_prediction(
     total_yes_price = sum(price for _market, price in adjacent_prices)
     max_total_price = float(config["trading"].get("model_awc_adjacent_yes_max_total_price", 0.9))
     adjacent_shares = float(config["trading"].get("model_awc_adjacent_yes_shares", 10))
+    non_adjacent_no = (
+        model_awc_best_non_adjacent_no_candidate(config, markets, adjacent_markets)
+        if not matched_prediction_markets
+        else None
+    )
     if total_yes_price >= max_total_price:
+        if non_adjacent_no is None:
+            LOGGER.info(
+                "model awc skip adjacent yes total too high and no non-adjacent no candidate city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f max=%.4f markets=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                total_yes_price,
+                max_total_price,
+                [market.market_id for market, _price in adjacent_prices],
+            )
+            return None
+        no_price = round(float(non_adjacent_no["price"]), 2)
+        max_buy_price = configured_max_buy_price(config)
+        if no_price <= max_buy_price:
+            no_market = non_adjacent_no["market"]
+            reason = (
+                f"model_awc_high_predicted_{predicted_high_f:.2f}_non_adjacent_no_{no_market.market_id}"
+                f"_adjacent_yes_total_{total_yes_price:.2f}_over_max_{max_total_price:.2f}_local_hour_{local_hour:02d}"
+            )
+            return submit_model_awc_trade(no_market, "NO", no_price, reason)
         LOGGER.info(
-            "model awc skip adjacent yes total too high city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f max=%.4f markets=%s",
+            "model awc skip adjacent yes total too high and non-adjacent no above max city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f total_yes_price=%.4f max=%.4f no_price=%.4f no_max=%.4f no_market=%s markets=%s",
             city,
             station,
             event_date,
@@ -2573,9 +2634,21 @@ def process_model_awc_prediction(
             predicted_high_f,
             total_yes_price,
             max_total_price,
+            no_price,
+            max_buy_price,
+            non_adjacent_no["market"].market_id,
             [market.market_id for market, _price in adjacent_prices],
         )
         return None
+
+    if non_adjacent_no is not None and float(non_adjacent_no["price"]) < total_yes_price:
+        no_market = non_adjacent_no["market"]
+        no_price = round(float(non_adjacent_no["price"]), 2)
+        reason = (
+            f"model_awc_high_predicted_{predicted_high_f:.2f}_non_adjacent_no_{no_market.market_id}"
+            f"_cheaper_than_adjacent_yes_{total_yes_price:.2f}_local_hour_{local_hour:02d}"
+        )
+        return submit_model_awc_trade(no_market, "NO", no_price, reason)
 
     created: list[PaperTrade] = []
     adjacent_market_ids = "_".join(market.market_id for market, _price in adjacent_prices)
