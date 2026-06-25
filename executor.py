@@ -535,10 +535,19 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
+        balance_before = self.get_balance(refresh=True)
+        if balance_before < clean_amount:
+            return OrderResult(
+                success=False, status=REJECTED,
+                error=f"Insufficient USDC balance: ${balance_before:.2f} available < ${clean_amount:.2f} required",
+                side="BUY", price=market_price, amount_usd=clean_amount,
+                shares=shares, token_id=token_id[:16] + "...",
+                dry_run=False, balance_before=balance_before,
+            )
+
         print(f"  [order] Market price: ${market_price:.3f}/share "
               f"-> {int(shares)} shares for ${clean_amount:.2f}")
 
-        balance_before = self.get_balance()
         token_balance_before = self._get_token_balance_optional(token_id)
         try:
             result = self.client.create_and_post_order(
@@ -649,6 +658,22 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
+        if not self.dry_run:
+            if not self._initialized:
+                return OrderResult(success=False, status=FAILED, error="Not initialized")
+
+            balance_before = self.get_balance(refresh=True)
+            if balance_before < clean_amount:
+                return OrderResult(
+                    success=False, status=REJECTED,
+                    error=f"Insufficient USDC balance: ${balance_before:.2f} available < ${clean_amount:.2f} required",
+                    side="BUY", price=market_price, amount_usd=clean_amount,
+                    shares=shares, token_id=token_id[:16] + "...",
+                    dry_run=False, balance_before=balance_before,
+                )
+        else:
+            balance_before = 0.0
+
         print(f"  [order] Posting buy: ${market_price:.3f}/share "
               f"-> {int(shares)} shares for ${clean_amount:.2f}")
 
@@ -660,10 +685,6 @@ class Executor:
                 token_id=token_id[:16] + "...", dry_run=True,
             )
 
-        if not self._initialized:
-            return OrderResult(success=False, status=FAILED, error="Not initialized")
-
-        balance_before = self.get_balance()
         token_balance_before = self._get_token_balance_optional(token_id)
         try:
             result = self.client.create_and_post_order(

@@ -73,6 +73,8 @@ TGFTP_OBS_BY_STATION: dict[str, dict[str, Any]] = {}
 PRICE_MOMENTUM_WINDOWS: dict[str, dict[str, Any]] = {}
 PRICE_RECORDING_WINDOWS: dict[str, dict[str, Any]] = {}
 STATION_BY_EVENT_URL: dict[str, str] = {}
+SOURCE_STATION_DISABLED_CITIES_BY_DATE: dict[str, set[str]] = {}
+SOURCE_STATION_GUARD_LOCK = threading.RLock()
 WEBSOCKET_ASSET_REFRESH_REQUESTS: "queue.Queue[dict[str, Any]]" = queue.Queue()
 WEBSOCKET_ASSET_UPDATES: "queue.Queue[dict[str, Any]]" = queue.Queue()
 WEBSOCKET_ASSET_REFRESH_DEDUP: set[tuple[str, str, str]] = set()
@@ -300,7 +302,7 @@ def default_config() -> dict[str, Any]:
     }
     city_stations = {
         "Atlanta": "KATL", "Austin": "KAUS", "Chicago": "KMDW", "Dallas": "KDAL",
-        "Denver": "KDEN", "Houston": "KHOU", "Los Angeles": "KLAX", "Miami": "KMIA",
+        "Denver": "KBKF", "Houston": "KHOU", "Los Angeles": "KLAX", "Miami": "KMIA",
         "NYC": "KLGA", "San Francisco": "KSFO", "Seattle": "KSEA",
     }
     trading = {
@@ -333,11 +335,15 @@ def default_config() -> dict[str, Any]:
         "live_trading_dry_run": False,
         "live_order_timeout_seconds": 20,
         "live_order_check_seconds": 1,
+        "max_buy_price": 0.85,
+        "source_station_check_enabled": True,
+        "source_station_check_hour_ct": 3,
+        "source_station_check_timezone": "America/Chicago",
         "depth_price_notional_multiplier": 2.0,
         "depth_price_extra_levels": 1,
         "model_awc_enabled": True,
-        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl",
-        "model_awc_live_stations": ["KAUS", "KSEA"],
+        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_kbkf_denver/lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL"],
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 18,
         "model_awc_metar_lookback_hours": 7,
@@ -352,7 +358,6 @@ def default_config() -> dict[str, Any]:
             "KDAL": 56,
             "KHOU": 56,
             "KSEA": 56,
-            "KDEN": 56,
             "KMIA": 56,
         },
         "model_awc_station_poll_stagger_seconds": 5,
@@ -991,6 +996,160 @@ def station_for_event(config: dict[str, Any], city: str, event_url: str, allow_n
     if station:
         STATION_BY_EVENT_URL[event_url] = station
     return station
+
+
+def source_station_for_event(config: dict[str, Any], city: str, event_url: str) -> str:
+    """Resolve the Polymarket settlement source station from the event page."""
+    if not event_url:
+        return ""
+    try:
+        return station_from_wu_url(extract_wunderground_source(config, event_url))
+    except requests.RequestException as exc:
+        LOGGER.warning("source station check request failed city=%s url=%s error=%s", city, event_url, exc)
+        return ""
+    except Exception:
+        LOGGER.exception("source station check failed city=%s url=%s", city, event_url)
+        return ""
+
+
+def source_station_block_city(event_date: str, city: str) -> None:
+    """Block live trading for one city/date after source-station mismatch."""
+    if not event_date or not city:
+        return
+    with SOURCE_STATION_GUARD_LOCK:
+        SOURCE_STATION_DISABLED_CITIES_BY_DATE.setdefault(event_date, set()).add(city)
+
+
+def source_station_city_blocked(event_date: str, city: str) -> bool:
+    """Return whether source-station guard has blocked live trading for a city/date."""
+    if not event_date or not city:
+        return False
+    with SOURCE_STATION_GUARD_LOCK:
+        return city in SOURCE_STATION_DISABLED_CITIES_BY_DATE.get(event_date, set())
+
+
+def prune_source_station_blocks(today: date) -> None:
+    """Drop stale source-station guard blocks from previous event dates."""
+    with SOURCE_STATION_GUARD_LOCK:
+        for event_date in list(SOURCE_STATION_DISABLED_CITIES_BY_DATE):
+            try:
+                parsed = date.fromisoformat(event_date)
+            except ValueError:
+                SOURCE_STATION_DISABLED_CITIES_BY_DATE.pop(event_date, None)
+                continue
+            if parsed < today:
+                SOURCE_STATION_DISABLED_CITIES_BY_DATE.pop(event_date, None)
+
+
+def check_polymarket_source_stations(config: dict[str, Any], target: date) -> dict[str, Any]:
+    """Compare Polymarket weather source stations with configured city stations."""
+    mismatches: list[dict[str, str]] = []
+    checked: dict[str, dict[str, str]] = {}
+    events = discover_temperature_events(config, target)
+    for event in events:
+        city = str(event.get("_parsed_city") or "")
+        event_date = str(event.get("_parsed_event_date") or target.isoformat())
+        event_url = poly_url_from_event(event)
+        configured = configured_station_for_city(config, city)
+        if not city or not configured:
+            continue
+        key = f"{event_date}:{city}"
+        if key in checked:
+            continue
+        source_station = source_station_for_event(config, city, event_url)
+        if not source_station:
+            LOGGER.warning(
+                "source station check unavailable city=%s event_date=%s configured_station=%s url=%s",
+                city,
+                event_date,
+                configured,
+                event_url,
+            )
+            continue
+        checked[key] = {
+            "city": city,
+            "event_date": event_date,
+            "configured_station": configured,
+            "source_station": source_station,
+            "polymarket_url": event_url,
+        }
+        if source_station != configured:
+            source_station_block_city(event_date, city)
+            mismatch = checked[key]
+            mismatches.append(mismatch)
+            LOGGER.error(
+                "source station mismatch blocking live trades city=%s event_date=%s configured_station=%s source_station=%s url=%s",
+                city,
+                event_date,
+                configured,
+                source_station,
+                event_url,
+            )
+        else:
+            LOGGER.info(
+                "source station check ok city=%s event_date=%s station=%s",
+                city,
+                event_date,
+                configured,
+            )
+    LOGGER.info(
+        "source station check complete target=%s events=%s checked_cities=%s mismatches=%s",
+        target.isoformat(),
+        len(events),
+        len(checked),
+        len(mismatches),
+    )
+    return {
+        "target": target.isoformat(),
+        "events": len(events),
+        "checked": list(checked.values()),
+        "mismatches": mismatches,
+    }
+
+
+def next_source_station_check_time(config: dict[str, Any], now: Optional[datetime] = None) -> datetime:
+    """Return the next configured source-station check time."""
+    trading = config.get("trading", {})
+    tz_name = str(trading.get("source_station_check_timezone", "America/Chicago"))
+    tz = ZoneInfo(tz_name)
+    now_local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    check_hour = int(trading.get("source_station_check_hour_ct", 3))
+    candidate = now_local.replace(hour=check_hour, minute=0, second=0, microsecond=0)
+    if now_local >= candidate:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def source_station_guard_supervisor(config: dict[str, Any]) -> None:
+    """Run the Polymarket source-station guard once daily at the configured CT hour."""
+    if not bool(config.get("trading", {}).get("source_station_check_enabled", True)):
+        LOGGER.info("source station guard disabled")
+        return
+    tz_name = str(config.get("trading", {}).get("source_station_check_timezone", "America/Chicago"))
+    tz = ZoneInfo(tz_name)
+    check_hour = int(config.get("trading", {}).get("source_station_check_hour_ct", 3))
+    last_checked_date = ""
+    LOGGER.info("source station guard started timezone=%s check_hour=%s", tz_name, check_hour)
+    while True:
+        try:
+            now_local = datetime.now(tz)
+            prune_source_station_blocks(now_local.date())
+            if now_local.hour >= check_hour and last_checked_date != now_local.date().isoformat():
+                check_polymarket_source_stations(config, now_local.date())
+                last_checked_date = now_local.date().isoformat()
+            next_check = next_source_station_check_time(config)
+            sleep_seconds = max(30.0, min(900.0, (next_check - datetime.now(tz)).total_seconds()))
+            time.sleep(sleep_seconds)
+        except Exception:
+            LOGGER.exception("source station guard loop failed")
+            time.sleep(300)
+
+
+def start_source_station_guard_thread(config: dict[str, Any]) -> threading.Thread:
+    """Start the daily source-station guard in a daemon thread."""
+    thread = threading.Thread(target=source_station_guard_supervisor, args=(config,), name="source-station-guard", daemon=True)
+    thread.start()
+    return thread
 
 
 def infer_temperature_unit(text: str, default_unit: str = "F") -> str:
@@ -2033,6 +2192,18 @@ def model_awc_live_station(config: dict[str, Any]) -> str:
     """Return a display value for model AWC live stations."""
     stations = sorted(model_awc_live_stations(config))
     return ",".join(stations) if stations else "KAUS"
+
+
+def configured_max_buy_price(config: dict[str, Any]) -> float:
+    """Return the configured max live buy price, clamped to a valid probability range."""
+    raw = config.get("trading", {}).get("max_buy_price", 0.85)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.85
+    if value <= 0 or value >= 1:
+        return 0.85
+    return value
 
 
 def model_awc_load_model(config: dict[str, Any]) -> Any:
@@ -3220,7 +3391,26 @@ class LiveTradingManager:
         if not token_id:
             LOGGER.warning("live buy skipped missing token side=%s market=%s", side, market.market_id)
             return None
+        if source_station_city_blocked(market.event_date, market.city):
+            LOGGER.warning(
+                "live buy skipped source station mismatch block city=%s event_date=%s market=%s side=%s",
+                market.city,
+                market.event_date,
+                market.market_id,
+                side,
+            )
+            return None
         amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
+        max_price = configured_max_buy_price(config)
+        if float(entry_price) > max_price:
+            LOGGER.info(
+                "live buy skipped price above configured max side=%s market=%s price=%.4f max_buy_price=%.4f",
+                side,
+                market.market_id,
+                float(entry_price),
+                max_price,
+            )
+            return None
         neg_risk = market_neg_risk(market)
         result = self.executor.place_buy_order(token_id, amount, price=entry_price, neg_risk=neg_risk)
         if not _result_value(result, "success", False):
@@ -6982,6 +7172,7 @@ def run(config: dict[str, Any]) -> None:
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
+    start_source_station_guard_thread(config)
     start_model_awc_thread(config)
     try:
         while True:

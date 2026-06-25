@@ -49,7 +49,7 @@
                                          "Austin":  "KAUS",
                                          "Chicago":  "KORD",
                                          "Dallas":  "KDAL",
-                                         "Denver":  "KDEN",
+                                         "Denver":  "KBKF",
                                          "Houston":  "KHOU",
                                          "Los Angeles":  "KLAX",
                                          "Miami":  "KMIA",
@@ -97,16 +97,25 @@
                     "live_trading_dry_run":  false,
                     "live_order_timeout_seconds":  20,
                     "live_order_check_seconds":  1,
+                    "max_buy_price":  0.85,
+                    "source_station_check_enabled":  true,
+                    "source_station_check_hour_ct":  3,
+                    "source_station_check_timezone":  "America/Chicago",
                     "depth_price_notional_multiplier":  2.0,
                     "depth_price_extra_levels":  1,
                     "weather_record_pre_window_seconds":  120,
                     "weather_record_receive_window_seconds":  300,
                     "tgftp_window_max_inflight_per_station":  10
                     ,"model_awc_enabled": true
-                    ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl"
+                    ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_kbkf_denver/lightgbm_metar_high_rolling_6y_best.pkl"
                     ,"model_awc_live_stations": [
+                        "KMIA",
+                        "KLAX",
+                        "KSFO",
+                        "KSEA",
+                        "KHOU",
                         "KAUS",
-                        "KSEA"
+                        "KATL"
                     ]
                     ,"model_awc_buy_start_hour": 12
                     ,"model_awc_buy_end_hour": 18
@@ -122,7 +131,6 @@
                         "KDAL": 54,
                         "KHOU": 54,
                         "KSEA": 54,
-                        "KDEN": 54,
                         "KMIA": 54
                     }
                     ,"model_awc_station_poll_stagger_seconds": 5
@@ -243,14 +251,23 @@
                                            "live_trading_dry_run":  false,
                                            "live_order_timeout_seconds":  20,
                                            "live_order_check_seconds":  1,
+                                           "max_buy_price":  0.85,
+                                           "source_station_check_enabled":  true,
+                                           "source_station_check_hour_ct":  3,
+                                           "source_station_check_timezone":  "America/Chicago",
                                            "weather_record_pre_window_seconds":  120,
                                            "weather_record_receive_window_seconds":  300,
                                            "tgftp_window_max_inflight_per_station":  10
                                            ,"model_awc_enabled": true
-                                           ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_20260623_205608/lightgbm_metar_high_rolling_6y_best.pkl"
+                                           ,"model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_kbkf_denver/lightgbm_metar_high_rolling_6y_best.pkl"
                                            ,"model_awc_live_stations": [
+                                               "KMIA",
+                                               "KLAX",
+                                               "KSFO",
+                                               "KSEA",
+                                               "KHOU",
                                                "KAUS",
-                                               "KSEA"
+                                               "KATL"
                                            ]
                                            ,"model_awc_buy_start_hour": 12
                                            ,"model_awc_buy_end_hour": 18
@@ -266,7 +283,6 @@
                                                "KDAL": 56,
                                                "KHOU": 56,
                                                "KSEA": 56,
-                                               "KDEN": 56,
                                                "KMIA": 56
                                            }
                                            ,"model_awc_station_poll_stagger_seconds": 5
