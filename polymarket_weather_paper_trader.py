@@ -308,7 +308,7 @@ def default_config() -> dict[str, Any]:
     trading = {
         "strategy_name": "deterministic_harvest",
         "strategy_mode": "deterministic_harvest",
-        "buy_notional_usdc": 5.0,
+        "buy_notional_usdc": 10.0,
         "fee_rate": 0.05,
         "fee_enabled": True,
         "deterministic_min_yes_price": 0.01,
@@ -474,7 +474,14 @@ def load_config(path: str) -> dict[str, Any]:
     """
     with open(path, "r", encoding="utf-8") as f:
         user_config = json.load(f)
-    return active_config(deep_merge(default_config(), user_config))
+    config = active_config(deep_merge(default_config(), user_config))
+    user_trading = user_config.get("trading", {}) if isinstance(user_config.get("trading", {}), dict) else {}
+    if "buy_notional_usdc" in user_trading:
+        config.setdefault("trading", {})["buy_notional_usdc"] = user_trading["buy_notional_usdc"]
+        for strategy in config.get("strategies", []) or []:
+            if isinstance(strategy, dict):
+                strategy.setdefault("trading", {})["buy_notional_usdc"] = user_trading["buy_notional_usdc"]
+    return config
 
 
 def redacted_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -1513,7 +1520,7 @@ def opposite_side(side: str) -> str:
 def depth_target_notional(config: dict[str, Any]) -> float:
     """Return the notional depth to inspect when selecting a live buy price."""
     trading = config.get("trading", {})
-    notional = float(trading.get("buy_notional_usdc", 5.0))
+    notional = float(trading.get("buy_notional_usdc", 10.0))
     multiplier = max(1.0, float(trading.get("depth_price_notional_multiplier", 2.0)))
     return max(notional, notional * multiplier)
 
@@ -2469,12 +2476,13 @@ def process_model_awc_prediction(
         price: float,
         reason: str,
         amount_usd: Optional[float] = None,
+        shares: Optional[float] = None,
     ) -> Optional[PaperTrade]:
         cycle_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
         trade = (
-            live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, amount_usd=amount_usd)
+            live_trader.submit_buy_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, amount_usd=amount_usd, shares=shares)
             if live_trader
-            else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, notional_usdc=amount_usd)
+            else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, notional_usdc=amount_usd, shares_override=shares)
         )
         if not trade:
             return None
@@ -2577,7 +2585,7 @@ def process_model_awc_prediction(
             f"model_awc_high_predicted_{predicted_high_f:.2f}_adjacent_yes_{adjacent_market_ids}"
             f"_shares_{adjacent_shares:g}_total_yes_{total_yes_price:.2f}_local_hour_{local_hour:02d}"
         )
-        trade = submit_model_awc_trade(market, "YES", price, reason, amount_usd=amount_usd)
+        trade = submit_model_awc_trade(market, "YES", price, reason, amount_usd=amount_usd, shares=adjacent_shares)
         if trade:
             created.append(trade)
     if len(created) != len(adjacent_prices):
@@ -3367,6 +3375,7 @@ class LiveTradingManager:
         observed_low: Optional[float],
         reason: str,
         amount_usd: Optional[float] = None,
+        shares: Optional[float] = None,
     ) -> Optional[PaperTrade]:
         """Post a live buy order and return a BUY_PENDING trade row when accepted by the CLOB.
         
@@ -3400,7 +3409,6 @@ class LiveTradingManager:
                 side,
             )
             return None
-        amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
         max_price = configured_max_buy_price(config)
         if float(entry_price) > max_price:
             LOGGER.info(
@@ -3412,7 +3420,29 @@ class LiveTradingManager:
             )
             return None
         neg_risk = market_neg_risk(market)
-        result = self.executor.place_buy_order(token_id, amount, price=entry_price, neg_risk=neg_risk)
+        if shares is not None:
+            amount = round(float(shares) * float(entry_price), 2)
+            LOGGER.info(
+                "live buy target fixed shares side=%s market=%s price=%.4f target_shares=%s target_amount_usd=%.2f neg_risk=%s",
+                side,
+                market.market_id,
+                float(entry_price),
+                shares,
+                amount,
+                neg_risk,
+            )
+            result = self.executor.place_buy_order_shares(token_id, float(shares), price=entry_price, neg_risk=neg_risk)
+        else:
+            amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
+            LOGGER.info(
+                "live buy target notional side=%s market=%s price=%.4f target_amount_usd=%.2f neg_risk=%s",
+                side,
+                market.market_id,
+                float(entry_price),
+                amount,
+                neg_risk,
+            )
+            result = self.executor.place_buy_order(token_id, amount, price=entry_price, neg_risk=neg_risk)
         if not _result_value(result, "success", False):
             LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
             return None
@@ -3429,6 +3459,7 @@ class LiveTradingManager:
             observed_low,
             reason,
             notional_usdc=float(_result_value(result, "amount_usd", amount)),
+            shares_override=float(_result_value(result, "shares", shares or 0.0)) if shares is not None else None,
         )
         self._apply_buy_result_to_trade(trade, result, pending=True)
         self._register_pending(
@@ -3809,6 +3840,7 @@ def make_trade(
     observed_low: Optional[float],
     reason: str,
     notional_usdc: Optional[float] = None,
+    shares_override: Optional[float] = None,
 ) -> PaperTrade:
     """Create a PaperTrade record for a deterministic strategy entry.
     
@@ -3830,8 +3862,12 @@ def make_trade(
     now = datetime.now().isoformat(timespec="seconds")
     side = side.upper()
     price = float(entry_price)
-    notional = float(notional_usdc if notional_usdc is not None else config["trading"]["buy_notional_usdc"])
-    shares = notional / price if price > 0 else 0.0
+    if shares_override is not None:
+        shares = float(shares_override)
+        notional = shares * price
+    else:
+        notional = float(notional_usdc if notional_usdc is not None else config["trading"]["buy_notional_usdc"])
+        shares = notional / price if price > 0 else 0.0
     fee = taker_fee_usdc(shares, price, float(config["trading"]["fee_rate"]), bool(config["trading"].get("fee_enabled", True)))
     comparable_min, comparable_max, comparable_unit = comparable_rule_bounds(market, market.unit)
     return PaperTrade(
