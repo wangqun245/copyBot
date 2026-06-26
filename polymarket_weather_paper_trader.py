@@ -43,6 +43,7 @@ import websocket
 from featurize_metar_history import (
     MetarRow as FeatureMetarRow,
     STATION_IDS as FEATURE_STATION_IDS,
+    add_observation_context_features,
     decode_metar,
     nearest_lag_value,
 )
@@ -342,23 +343,24 @@ def default_config() -> dict[str, Any]:
         "depth_price_notional_multiplier": 2.0,
         "depth_price_extra_levels": 1,
         "model_awc_enabled": True,
-        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_kbkf_denver/lightgbm_metar_high_rolling_6y_best.pkl",
+        "model_awc_model_path": "models/lightgbm_rolling_6y_holdout_24h_lag6_speci_context_regular_20260625_2240/lightgbm_metar_high_rolling_6y_best.pkl",
         "model_awc_live_stations": ["KMIA", "KLAX", "KSFO", "KSEA", "KHOU", "KAUS", "KATL"],
         "model_awc_buy_start_hour": 12,
         "model_awc_buy_end_hour": 18,
         "model_awc_metar_lookback_hours": 7,
         "model_awc_observation_minute": 53,
         "model_awc_station_observation_minutes": {
-            "KORD": 53,
-            "KATL": 54,
-            "KLGA": 54,
-            "KSFO": 59,
-            "KBKF": 0,
-            "KAUS": 56,
-            "KDAL": 56,
-            "KHOU": 56,
-            "KSEA": 56,
-            "KMIA": 56,
+            "KORD": 51,
+            "KATL": 52,
+            "KLGA": 51,
+            "KSFO": 56,
+            "KBKF": 58,
+            "KAUS": 53,
+            "KDAL": 53,
+            "KHOU": 53,
+            "KLAX": 53,
+            "KSEA": 53,
+            "KMIA": 53,
         },
         "model_awc_station_poll_stagger_seconds": 5,
         "model_awc_lag_tolerance_minutes": 30,
@@ -2296,6 +2298,11 @@ def model_awc_station_stagger_seconds(config: dict[str, Any], station: str) -> i
     return same_minute.index(station) * stagger
 
 
+def model_awc_is_extra_metar_row(row: FeatureMetarRow, regular_minute: int) -> bool:
+    """Return whether a parsed AWC row should be used only as context, not as a model trigger row."""
+    return row.valid_utc.minute != regular_minute or " COR " in f" {row.metar} "
+
+
 def model_awc_feature_row(
     config: dict[str, Any],
     city: str,
@@ -2319,7 +2326,14 @@ def model_awc_feature_row(
     if not parsed:
         return None
 
-    latest = parsed[-1]
+    regular_minute = model_awc_station_observation_minute(config, station)
+    extra_flags = [model_awc_is_extra_metar_row(item, regular_minute) for item in parsed]
+    regular_inputs = [item for item, is_extra in zip(parsed, extra_flags) if not is_extra]
+    if not regular_inputs:
+        LOGGER.info("model awc skip no regular input rows station=%s rows=%s regular_minute=%s", station, len(parsed), regular_minute)
+        return None
+
+    latest = regular_inputs[-1]
     latest_local = latest.valid_utc.astimezone(tz)
     start_hour = int(config["trading"].get("model_awc_buy_start_hour", 12))
     end_hour = int(config["trading"].get("model_awc_buy_end_hour", 18))
@@ -2331,7 +2345,8 @@ def model_awc_feature_row(
     iso = latest_local.isocalendar()
     features["local_week_of_year"] = float(iso.week)
     valid_times = [item.valid_utc for item in parsed]
-    temp_values = [decode_metar(item, station, tz).get("temp_f") for item in parsed]
+    decoded_rows = [decode_metar(item, station, tz) for item in parsed]
+    temp_values = [decoded.get("temp_f") for decoded in decoded_rows]
     tolerance = timedelta(minutes=int(config["trading"].get("model_awc_lag_tolerance_minutes", 30)))
     current_temp = features.get("temp_f")
     for hours in range(1, model_awc_required_lag_hours(config) + 1):
@@ -2340,6 +2355,16 @@ def model_awc_feature_row(
         features[f"temp_f_change_{hours}h"] = (
             None if current_temp is None or lag_value is None else float(current_temp) - float(lag_value)
         )
+    latest_idx = parsed.index(latest)
+    add_observation_context_features(
+        features=features,
+        row=latest,
+        row_idx=latest_idx,
+        valid_times=valid_times,
+        temp_values=temp_values,
+        extra_flags=extra_flags,
+        window=timedelta(hours=6),
+    )
     return features, latest, latest_local
 
 
@@ -2370,6 +2395,54 @@ def model_awc_trade_exists_for_window(trades: list[PaperTrade], strategy_name: s
     marker = f"model_awc_high:{city}:{station}:{event_date}:hour_{local_hour:02d}"
     active_statuses = {"OPEN", "BUY_PENDING", "SELL_PENDING"}
     return any(t.strategy == strategy_name and t.status in active_statuses and marker in t.cycle_id for t in trades)
+
+
+def model_awc_active_event_positions(trades: list[PaperTrade], strategy_name: str, city: str, event_date: str) -> list[PaperTrade]:
+    """Return active model-relevant positions for one city and event date."""
+    active_statuses = {"OPEN", "BUY_PENDING", "SELL_PENDING", "HEDGED"}
+    return [
+        trade
+        for trade in trades
+        if trade.status in active_statuses
+        and trade.strategy == strategy_name
+        and trade.city == city
+        and trade.kind == "Highest"
+        and trade.event_date == event_date
+    ]
+
+
+def model_awc_entry_unit_price(trade: PaperTrade) -> float:
+    """Return the held unit entry price, preferring the recorded fill price over fee-inclusive cost."""
+    price = safe_float(trade.yes_price, 0.0)
+    if price > 0:
+        return price
+    shares = safe_float(trade.shares, 0.0)
+    if shares <= 0:
+        return 0.0
+    return safe_float(trade.total_cost_usdc, 0.0) / shares
+
+
+def model_awc_adjacent_yes_position_summary(
+    active_positions: list[PaperTrade],
+    adjacent_markets: tuple[TemperatureMarket, TemperatureMarket],
+) -> dict[str, dict[str, float]]:
+    """Aggregate held YES shares and weighted entry price for the two adjacent markets."""
+    adjacent_ids = {market.market_id for market in adjacent_markets}
+    summary: dict[str, dict[str, float]] = {}
+    for trade in active_positions:
+        if (trade.position_side or "YES").upper() != "YES" or trade.market_id not in adjacent_ids:
+            continue
+        shares = safe_float(trade.shares, 0.0)
+        if shares <= 0:
+            continue
+        price = model_awc_entry_unit_price(trade)
+        row = summary.setdefault(trade.market_id, {"shares": 0.0, "weighted_cost": 0.0})
+        row["shares"] += shares
+        row["weighted_cost"] += shares * price
+    for row in summary.values():
+        shares = row["shares"]
+        row["avg_price"] = row["weighted_cost"] / shares if shares > 0 else 0.0
+    return summary
 
 
 def model_awc_market_candidate(
@@ -2492,9 +2565,8 @@ def process_model_awc_prediction(
     trades = read_trades(config["outputs"]["trades_csv"])
     strategy_name = str(config["trading"]["strategy_name"])
     local_hour = int(latest_local.hour)
-    if model_awc_trade_exists_for_window(trades, strategy_name, city, station, event_date, local_hour):
-        LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
-        return None
+    duplicate_window = model_awc_trade_exists_for_window(trades, strategy_name, city, station, event_date, local_hour)
+    active_event_positions = model_awc_active_event_positions(trades, strategy_name, city, event_date)
 
     markets = [m for m in markets_for_event(config, event) if not m.closed and m.kind == "Highest"]
     if not markets:
@@ -2549,6 +2621,9 @@ def process_model_awc_prediction(
 
     predicted_yes_market = model_awc_predicted_yes_market(markets, predicted_high_f, event_unit)
     if predicted_yes_market is not None:
+        if duplicate_window:
+            LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
+            return None
         candidates = []
         for market in markets:
             candidate = model_awc_market_candidate(config, market, predicted_high_f, event_unit, predicted_yes_market.market_id)
@@ -2597,6 +2672,109 @@ def process_model_awc_prediction(
     total_yes_price = sum(price for _market, price in adjacent_prices)
     max_total_price = float(config["trading"].get("model_awc_adjacent_yes_max_total_price", 0.9))
     adjacent_shares = float(config["trading"].get("model_awc_adjacent_yes_shares", 10))
+    held_no_exists = any((trade.position_side or "YES").upper() == "NO" for trade in active_event_positions)
+    held_adjacent_yes = model_awc_adjacent_yes_position_summary(active_event_positions, adjacent_markets)
+    if held_adjacent_yes and not held_no_exists:
+        held_market_ids = set(held_adjacent_yes)
+        if len(held_market_ids) >= len(adjacent_markets):
+            LOGGER.info(
+                "model awc skip adjacent hedge already has both yes sides city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f markets=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                sorted(held_market_ids),
+            )
+            return None
+        missing = [(market, price) for market, price in adjacent_prices if market.market_id not in held_market_ids]
+        if len(missing) != 1:
+            LOGGER.info(
+                "model awc skip adjacent hedge ambiguous held yes city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f held=%s missing=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                sorted(held_market_ids),
+                [market.market_id for market, _price in missing],
+            )
+            return None
+        held_market_id = next(iter(held_market_ids))
+        held_summary = held_adjacent_yes[held_market_id]
+        held_cost_price = round(float(held_summary.get("avg_price", 0.0)), 4)
+        hedge_market, hedge_price = missing[0]
+        hedge_total_price = held_cost_price + float(hedge_price)
+        held_shares = float(held_summary.get("shares", 0.0))
+        hedge_shares = held_shares
+        if held_shares <= 0 or hedge_shares <= 0:
+            LOGGER.info(
+                "model awc skip adjacent hedge invalid shares city=%s station=%s event_date=%s local_hour=%s held_market=%s held_shares=%s hedge_shares=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                held_market_id,
+                held_shares,
+                hedge_shares,
+            )
+            return None
+        if hedge_total_price > max_total_price:
+            LOGGER.info(
+                "model awc skip adjacent hedge total too high city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f held_market=%s held_cost=%.4f hedge_market=%s hedge_price=%.4f total=%.4f max=%.4f held_shares=%s hedge_shares=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                held_market_id,
+                held_cost_price,
+                hedge_market.market_id,
+                hedge_price,
+                hedge_total_price,
+                max_total_price,
+                held_shares,
+                hedge_shares,
+            )
+            return None
+        if open_trade_exists(trades, strategy_name, hedge_market.market_id, "YES"):
+            LOGGER.info(
+                "model awc skip adjacent hedge duplicate target city=%s station=%s event_date=%s local_hour=%s hedge_market=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                hedge_market.market_id,
+            )
+            return None
+        amount_usd = round(hedge_shares * round(float(hedge_price), 2), 2)
+        reason = (
+            f"model_awc_high_predicted_{predicted_high_f:.2f}_adjacent_yes_hedge_{held_market_id}_with_{hedge_market.market_id}"
+            f"_held_cost_{held_cost_price:.2f}_hedge_price_{hedge_price:.2f}_total_yes_{hedge_total_price:.2f}"
+            f"_held_shares_{held_shares:g}_hedge_shares_{hedge_shares:g}_local_hour_{local_hour:02d}"
+        )
+        trade = submit_model_awc_trade(hedge_market, "YES", hedge_price, reason, amount_usd=amount_usd, shares=hedge_shares)
+        if trade:
+            LOGGER.info(
+                "model awc adjacent hedge buy completed city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f held_market=%s hedge_market=%s held_cost=%.4f hedge_price=%.4f total=%.4f held_shares=%s hedge_shares=%s trade=%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                held_market_id,
+                hedge_market.market_id,
+                held_cost_price,
+                hedge_price,
+                hedge_total_price,
+                held_shares,
+                hedge_shares,
+                trade.trade_id,
+            )
+        return trade
+    if duplicate_window:
+        LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
+        return None
     non_adjacent_no = (
         model_awc_best_non_adjacent_no_candidate(config, markets, adjacent_markets)
         if not matched_prediction_markets
