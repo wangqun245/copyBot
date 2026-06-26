@@ -141,6 +141,7 @@
                     ,"model_awc_poll_attempts": 5
                     ,"model_awc_adjacent_yes_max_total_price": 0.9
                     ,"model_awc_adjacent_yes_shares": 10
+                    ,"model_awc_interval_snap_tolerance_f": 0.15
                 },
     "scheduler":  {
                       "poll_interval_minutes":  15,
@@ -294,6 +295,7 @@
                                            ,"model_awc_poll_attempts": 5
                                            ,"model_awc_adjacent_yes_max_total_price": 0.9
                                            ,"model_awc_adjacent_yes_shares": 10
+                                           ,"model_awc_interval_snap_tolerance_f": 0.15
                                        }
                        }
                    ]

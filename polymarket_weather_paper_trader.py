@@ -369,6 +369,7 @@ def default_config() -> dict[str, Any]:
         "model_awc_poll_attempts": 5,
         "model_awc_adjacent_yes_max_total_price": 0.9,
         "model_awc_adjacent_yes_shares": 10,
+        "model_awc_interval_snap_tolerance_f": 0.15,
     }
     return {
     "api": {
@@ -2493,6 +2494,43 @@ def model_awc_prediction_matches(
     return [market for market in markets if market_contains_temperature(market, float(predicted), event_unit)]
 
 
+def model_awc_interval_snap_tolerance(config: dict[str, Any], event_unit: str) -> float:
+    """Return the configured boundary snap tolerance in the event market unit."""
+    tolerance_f = max(0.0, float(config["trading"].get("model_awc_interval_snap_tolerance_f", 0.15)))
+    return tolerance_f * 5.0 / 9.0 if event_unit.upper() == "C" else tolerance_f
+
+
+def model_awc_boundary_snap_market(
+    config: dict[str, Any],
+    markets: list[TemperatureMarket],
+    predicted_high_f: float,
+    event_unit: str,
+) -> Optional[tuple[TemperatureMarket, float]]:
+    """Return a nearby interval when the model prediction is just outside its boundary."""
+    predicted = convert_temperature(predicted_high_f, "F", event_unit)
+    if predicted is None:
+        return None
+    tolerance = model_awc_interval_snap_tolerance(config, event_unit)
+    if tolerance <= 0:
+        return None
+    epsilon = 1e-9
+    candidates: list[tuple[float, TemperatureMarket]] = []
+    for market in markets:
+        lo, hi, _ = comparable_rule_bounds(market, event_unit)
+        if lo is not None and float(predicted) < lo:
+            distance = lo - float(predicted)
+            if distance <= tolerance + epsilon:
+                candidates.append((distance, market))
+        if hi is not None and float(predicted) > hi:
+            distance = float(predicted) - hi
+            if distance <= tolerance + epsilon:
+                candidates.append((distance, market))
+    if not candidates:
+        return None
+    distance, market = min(candidates, key=lambda item: (item[0], str(item[1].market_id)))
+    return market, distance
+
+
 def model_awc_adjacent_prediction_markets(
     markets: list[TemperatureMarket],
     predicted_high_f: float,
@@ -2639,6 +2677,47 @@ def process_model_awc_prediction(
         price = round(float(selected["price"]), 2)
         reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
         return submit_model_awc_trade(market, side, price, reason)
+
+    snapped = model_awc_boundary_snap_market(config, markets, predicted_high_f, event_unit)
+    if snapped is not None:
+        if duplicate_window:
+            LOGGER.info("model awc skip duplicate city=%s station=%s event_date=%s local_hour=%s", city, station, event_date, local_hour)
+            return None
+        snap_market, snap_distance = snapped
+        yes_price = best_buy_price(config, snap_market, "YES")
+        if yes_price is None or yes_price <= 0:
+            LOGGER.info(
+                "model awc skip snapped interval missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f market=%s distance=%.4f%s",
+                city,
+                station,
+                event_date,
+                local_hour,
+                predicted_high_f,
+                snap_market.market_id,
+                snap_distance,
+                event_unit,
+            )
+            return None
+        price = round(float(yes_price), 2)
+        tolerance_f = float(config["trading"].get("model_awc_interval_snap_tolerance_f", 0.15))
+        reason = (
+            f"model_awc_high_predicted_{predicted_high_f:.2f}_boundary_snap_yes_{snap_market.market_id}"
+            f"_distance_{snap_distance:.3f}{event_unit}_tolerance_{tolerance_f:.2f}F_local_hour_{local_hour:02d}"
+        )
+        LOGGER.info(
+            "model awc boundary snap city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%.2f market=%s distance=%.4f%s tolerance_f=%.4f yes_price=%.4f",
+            city,
+            station,
+            event_date,
+            local_hour,
+            predicted_high_f,
+            snap_market.market_id,
+            snap_distance,
+            event_unit,
+            tolerance_f,
+            price,
+        )
+        return submit_model_awc_trade(snap_market, "YES", price, reason)
 
     matched_prediction_markets = model_awc_prediction_matches(markets, predicted_high_f, event_unit)
     adjacent_markets = model_awc_adjacent_prediction_markets(markets, predicted_high_f, event_unit)
