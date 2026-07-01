@@ -2610,6 +2610,26 @@ def model_awc_is_extra_metar_row(row: FeatureMetarRow, regular_minute: int) -> b
     return row.valid_utc.minute != regular_minute or " COR " in f" {row.metar} "
 
 
+def model_awc_observed_high_f_so_far(
+    rows: list[FeatureMetarRow],
+    temp_values: list[object | None],
+    tz: ZoneInfo,
+    as_of_utc: datetime,
+) -> Optional[float]:
+    """Return the factual local-day METAR high through the trigger observation."""
+    target_date = as_of_utc.astimezone(tz).date()
+    observed = []
+    for row, value in zip(rows, temp_values):
+        if row.valid_utc > as_of_utc or row.valid_utc.astimezone(tz).date() != target_date:
+            continue
+        try:
+            if value not in (None, ""):
+                observed.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return max(observed) if observed else None
+
+
 def model_awc_feature_row(
     config: dict[str, Any],
     city: str,
@@ -2659,6 +2679,12 @@ def model_awc_feature_row(
     valid_times = [item.valid_utc for item in parsed]
     decoded_rows = [decode_metar(item, station, tz) for item in parsed]
     temp_values = [decoded.get("temp_f") for decoded in decoded_rows]
+    features["_observed_local_day_high_f_so_far"] = model_awc_observed_high_f_so_far(
+        parsed,
+        temp_values,
+        tz,
+        latest.valid_utc,
+    )
     previous_highs, previous_lows, current_mins = daily_temperature_context_series(parsed, temp_values, tz)
     tolerance = timedelta(minutes=int(config["trading"].get("model_awc_lag_tolerance_minutes", 30)))
     current_temp = features.get("temp_f")
@@ -2685,7 +2711,7 @@ def model_awc_feature_row(
 
 
 def model_awc_predict_high(config: dict[str, Any], features: dict[str, Any]) -> float:
-    """Run the loaded LightGBM model and return predicted daily high in Fahrenheit."""
+    """Return the model high, bounded below by the factual observed high."""
     model = model_awc_load_model(config)
     feature_names = list(getattr(model, "feature_name_", []))
     if not feature_names:
@@ -2703,7 +2729,21 @@ def model_awc_predict_high(config: dict[str, Any], features: dict[str, Any]) -> 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         prediction = model.predict([row], num_iteration=getattr(model, "best_iteration_", None))
-    return float(prediction[0])
+    raw_prediction = float(prediction[0])
+    observed_high = features.get("_observed_local_day_high_f_so_far")
+    try:
+        factual_floor = None if observed_high in (None, "") else float(observed_high)
+    except (TypeError, ValueError):
+        factual_floor = None
+    if factual_floor is not None and raw_prediction < factual_floor:
+        LOGGER.info(
+            "model awc prediction raised to observed high raw_prediction_f=%r "
+            "observed_high_f=%r",
+            raw_prediction,
+            factual_floor,
+        )
+        return factual_floor
+    return raw_prediction
 
 
 def model_awc_trade_exists_for_window(trades: list[PaperTrade], strategy_name: str, city: str, station: str, event_date: str, local_hour: int) -> bool:
