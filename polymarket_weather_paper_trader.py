@@ -2978,17 +2978,21 @@ def process_model_awc_prediction(
         )
         return trade
 
-    def start_single_notional_manager(market: TemperatureMarket, reason: str) -> Optional[PaperTrade]:
+    def start_single_notional_manager(
+        market: TemperatureMarket,
+        side: str,
+        reason: str,
+    ) -> Optional[PaperTrade]:
         if not live_trader:
             return None
         target_notional = float(config["trading"].get("buy_notional_usdc", 10.0))
-        partial = partial_buy_fillable_now(config, market, "YES", target_notional)
+        partial = partial_buy_fillable_now(config, market, side, target_notional)
         partial_trade = None
         remaining_notional = target_notional
         if partial is not None:
             partial_trade = submit_model_awc_trade(
                 market,
-                "YES",
+                side,
                 float(partial["price"]),
                 f"model_awc_high_single_partial_before_manager_{market.market_id}_{reason}_local_hour_{local_hour:02d}",
                 amount_usd=float(partial["amount_usd"]),
@@ -3017,7 +3021,7 @@ def process_model_awc_prediction(
             event_date,
             local_hour,
             (market,),
-            ("YES",),
+            (side,),
             0.0,
             predicted_high_f,
             "single",
@@ -3044,7 +3048,9 @@ def process_model_awc_prediction(
             if candidate:
                 candidates.append(candidate)
         if not candidates:
-            partial_trade = start_single_notional_manager(predicted_yes_market, "insufficient_current_depth")
+            partial_trade = start_single_notional_manager(
+                predicted_yes_market, "YES", "insufficient_current_depth"
+            )
             LOGGER.info("model awc skip no priced candidates city=%s station=%s predicted_high_f=%r", city, station, predicted_high_f)
             return partial_trade
         candidates.sort(key=lambda item: (float(item["price"]), str(item["market"].market_id), str(item["side"])))
@@ -3052,6 +3058,10 @@ def process_model_awc_prediction(
         market = selected["market"]
         side = str(selected["side"])
         price = round(float(selected["price"]), 2)
+        if price > configured_max_buy_price(config):
+            return start_single_notional_manager(
+                market, side, "current_price_above_configured_max"
+            )
         reason = f"model_awc_high_predicted_{predicted_high_f:.2f}_market_{predicted_yes_market.market_id}_local_hour_{local_hour:02d}"
         return submit_model_awc_trade(market, side, price, reason)
 
@@ -3063,7 +3073,9 @@ def process_model_awc_prediction(
         snap_market, snap_distance = snapped
         yes_price = best_buy_price(config, snap_market, "YES")
         if yes_price is None or yes_price <= 0:
-            partial_trade = start_single_notional_manager(snap_market, "snap_insufficient_current_depth")
+            partial_trade = start_single_notional_manager(
+                snap_market, "YES", "snap_insufficient_current_depth"
+            )
             LOGGER.info(
                 "model awc skip snapped interval missing yes price city=%s station=%s event_date=%s local_hour=%s predicted_high_f=%r market=%s distance=%r%s",
                 city,
@@ -3077,6 +3089,10 @@ def process_model_awc_prediction(
             )
             return partial_trade
         price = round(float(yes_price), 2)
+        if price > configured_max_buy_price(config):
+            return start_single_notional_manager(
+                snap_market, "YES", "snap_current_price_above_configured_max"
+            )
         tolerance_f = float(config["trading"].get("model_awc_interval_snap_tolerance_f", 0.15))
         reason = (
             f"model_awc_high_predicted_{predicted_high_f:.2f}_boundary_snap_yes_{snap_market.market_id}"
