@@ -586,6 +586,21 @@ def redacted_config(config: dict[str, Any]) -> dict[str, Any]:
     return redact(config)
 
 
+def current_process_rss_mb() -> Optional[float]:
+    """Return current process RSS in MB on Linux, if available."""
+    status_path = "/proc/self/status"
+    try:
+        with open(status_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return float(parts[1]) / 1024.0
+    except OSError:
+        return None
+    return None
+
+
 def setup_logging(config: dict[str, Any]) -> None:
     """Configure file and optional console logging for the bot process.
     
@@ -2587,6 +2602,49 @@ def model_awc_load_classifier(config: dict[str, Any]) -> tuple[Any, tuple[int, .
             classes[-1],
         )
     return MODEL_AWC_CLASSIFIER, MODEL_AWC_CLASSIFIER_CLASSES
+
+
+def model_awc_preload_models(config: dict[str, Any], reason: str = "startup") -> None:
+    """Load model-AWC models at startup and validate their feature compatibility."""
+    rss_before = current_process_rss_mb()
+    LOGGER.info(
+        "model awc preload start reason=%s rss_mb=%s classifier_enabled=%s",
+        reason,
+        None if rss_before is None else round(rss_before, 1),
+        model_awc_classifier_enabled(config),
+    )
+    model = model_awc_load_model(config)
+    model_features = [str(name) for name in getattr(model, "feature_name_", [])]
+    if not model_awc_classifier_enabled(config):
+        rss_after_regression = current_process_rss_mb()
+        LOGGER.info(
+            "model awc preload completed reason=%s classifier disabled regression_features=%s rss_mb=%s rss_delta_mb=%s",
+            reason,
+            len(model_features),
+            None if rss_after_regression is None else round(rss_after_regression, 1),
+            None if rss_before is None or rss_after_regression is None else round(rss_after_regression - rss_before, 1),
+        )
+        return
+    classifier, classes = model_awc_load_classifier(config)
+    classifier_features = [str(name) for name in getattr(classifier, "feature_name_", [])]
+    if model_features != classifier_features:
+        raise RuntimeError(
+            "model AWC classifier feature columns do not match regression model "
+            f"regression_features={len(model_features)} classifier_features={len(classifier_features)}"
+        )
+    rss_after = current_process_rss_mb()
+    LOGGER.info(
+        "model awc preload completed reason=%s regression_features=%s classifier_features=%s "
+        "classifier_classes=%s classifier_range=%s..%s rss_mb=%s rss_delta_mb=%s",
+        reason,
+        len(model_features),
+        len(classifier_features),
+        len(classes),
+        classes[0],
+        classes[-1],
+        None if rss_after is None else round(rss_after, 1),
+        None if rss_before is None or rss_after is None else round(rss_after - rss_before, 1),
+    )
 
 
 def model_awc_feature_vector(model: Any, features: dict[str, Any]) -> tuple[list[float], list[str]]:
@@ -8443,7 +8501,7 @@ def model_awc_supervisor(config: dict[str, Any]) -> None:
         if not model_awc_enabled(config):
             LOGGER.info("model awc supervisor disabled")
             return
-        model_awc_load_model(config)
+        model_awc_preload_models(config, reason="supervisor_startup")
     except Exception:
         LOGGER.exception("model awc supervisor failed during startup")
         return
@@ -9395,6 +9453,8 @@ def run(config: dict[str, Any]) -> None:
     cycle_num = 0
     max_cycles = int(config["scheduler"].get("max_cycles", 0))
     LOGGER.info("bot started config=%s", json.dumps(redacted_config(config), ensure_ascii=False, sort_keys=True))
+    if model_awc_enabled(config):
+        model_awc_preload_models(config, reason="service_startup")
     start_live_trader(config)
     sync_polymarket_positions_to_disk(config, reason="start")
     start_source_station_guard_thread(config)
