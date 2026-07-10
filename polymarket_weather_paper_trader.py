@@ -3276,21 +3276,22 @@ def model_awc_market_candidate(
     price = best_buy_price(config, market, side)
     if price is None or price <= 0:
         return None
+    executable_price = round(float(price), 2)
     min_side_price = configured_model_awc_min_side_price(config, side)
-    if float(price) < min_side_price:
+    if executable_price < min_side_price:
         return None
     combined_yes = None
     if combined_yes_probabilities is not None:
         combined_yes = combined_yes_probabilities.get(market.market_id, {}).get("combined_yes_probability")
     fair_price = model_awc_dynamic_side_price(config, combined_yes, side)
-    allowed, edge = model_awc_dynamic_price_allows_buy(config, fair_price, float(price))
+    allowed, edge = model_awc_dynamic_price_allows_buy(config, fair_price, executable_price)
     if not allowed:
         LOGGER.info(
             "model awc skip candidate no dynamic edge market=%s side=%s price=%.4f "
             "fair_price=%s combined_yes_probability=%s edge=%s",
             market.market_id,
             side,
-            float(price),
+            executable_price,
             None if fair_price is None else round(float(fair_price), 6),
             None if combined_yes is None else round(float(combined_yes), 6),
             None if edge is None else round(float(edge), 6),
@@ -3299,7 +3300,7 @@ def model_awc_market_candidate(
     return {
         "market": market,
         "side": side,
-        "price": float(price),
+        "price": executable_price,
         "fair_price": fair_price,
         "edge": edge,
         "combined_yes_probability": combined_yes,
@@ -3874,7 +3875,14 @@ def process_model_awc_prediction(
                     str(item["market"].market_id),
                 )
             )
-            classifier_choice = active_classifier_candidates[0] if active_classifier_candidates else None
+            classifier_choice = (
+                {
+                    **active_classifier_candidates[0],
+                    "active_candidates": active_classifier_candidates,
+                }
+                if active_classifier_candidates
+                else None
+            )
             if classifier_choice is None:
                 LOGGER.info(
                     "model awc skip classifier no active interval city=%s station=%s "
@@ -5242,7 +5250,13 @@ class LiveTradingManager:
                 amount,
                 neg_risk,
             )
-            result = self.executor.place_buy_order_shares(token_id, float(shares), price=entry_price, neg_risk=neg_risk)
+            result = self.executor.place_buy_order_shares(
+                token_id,
+                float(shares),
+                price=entry_price,
+                neg_risk=neg_risk,
+                max_buy_price=max_price,
+            )
         else:
             amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
             LOGGER.info(
@@ -5253,7 +5267,13 @@ class LiveTradingManager:
                 amount,
                 neg_risk,
             )
-            result = self.executor.place_buy_order(token_id, amount, price=entry_price, neg_risk=neg_risk)
+            result = self.executor.place_buy_order(
+                token_id,
+                amount,
+                price=entry_price,
+                neg_risk=neg_risk,
+                max_buy_price=max_price,
+            )
         if not _result_value(result, "success", False):
             LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
             return None
