@@ -245,6 +245,7 @@ class PaperTrade:
     live_sell_order_id: str = ""
     live_order_status: str = ""
     live_order_error: str = ""
+    model_details: str = ""
 
 
 @dataclass
@@ -306,6 +307,7 @@ class ModelAwcHourlyBatch:
     closed: bool = False
     open_order_cost_usd: dict[str, float] = field(default_factory=dict)
     max_buy_prices: dict[str, float] = field(default_factory=dict)
+    model_details: str = ""
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -2805,6 +2807,56 @@ def model_awc_dynamic_price_allows_buy(
     return float(price) < fair and edge > 0.0, edge
 
 
+def model_awc_market_label(market: TemperatureMarket) -> str:
+    if market.rule_min is None and market.rule_max is None:
+        return market.market_id
+    if market.rule_min is None:
+        return f"<={market.rule_max:g}{market.unit}"
+    if market.rule_max is None:
+        return f">={market.rule_min:g}{market.unit}"
+    return f"{market.rule_min:g}-{market.rule_max:g}{market.unit}"
+
+
+def model_awc_probability_pct(value: Any) -> str:
+    try:
+        if value is None:
+            return "n/a"
+        return f"{float(value) * 100.0:.2f}%"
+    except Exception:
+        return "n/a"
+
+
+def model_awc_build_trade_model_details(
+    *,
+    predicted_high_f: float,
+    rounded_prediction_f: Optional[int],
+    regression_market: TemperatureMarket,
+    classifier_market: Optional[TemperatureMarket],
+    classifier_probability: Optional[float],
+    regressor_probability: Optional[float],
+    selected_market: TemperatureMarket,
+    selected_side: str,
+    selected_price: float,
+    fair_price: Optional[float],
+    edge: Optional[float],
+    combined_yes_probability: Optional[float],
+) -> str:
+    classifier_label = model_awc_market_label(classifier_market) if classifier_market else "n/a"
+    regression_label = model_awc_market_label(regression_market)
+    selected_label = model_awc_market_label(selected_market)
+    return "\n".join(
+        [
+            f"Regression: {predicted_high_f:.2f}F -> {rounded_prediction_f}F / {regression_label}",
+            f"Regression prob: {model_awc_probability_pct(regressor_probability)}",
+            f"Classifier: {classifier_label} prob {model_awc_probability_pct(classifier_probability)}",
+            f"Selected: {selected_side.upper()} {selected_label} @ ${selected_price:.4f}",
+            f"Combined YES prob: {model_awc_probability_pct(combined_yes_probability)}",
+            f"Fair {selected_side.upper()} price: {model_awc_probability_pct(fair_price)}",
+            f"Edge after fee: {model_awc_probability_pct(edge)}",
+        ]
+    )
+
+
 def model_awc_preload_models(config: dict[str, Any], reason: str = "startup") -> None:
     """Load model-AWC models at startup and validate their feature compatibility."""
     rss_before = current_process_rss_mb()
@@ -3631,6 +3683,7 @@ def process_model_awc_prediction(
         amount_usd: Optional[float] = None,
         shares: Optional[float] = None,
         max_buy_price: Optional[float] = None,
+        model_details: str = "",
     ) -> Optional[PaperTrade]:
         cycle_id = (
             f"{datetime.now().strftime('%Y%m%dT%H%M%S')}:model_awc_high:{city}:{station}:{event_date}:"
@@ -3653,12 +3706,15 @@ def process_model_awc_prediction(
                 amount_usd=amount_usd,
                 shares=shares,
                 max_buy_price=max_buy_price,
+                model_details=model_details,
             )
             if live_trader
             else make_trade(config, cycle_id, market, "", station, side, price, predicted_high_f, None, reason, notional_usdc=amount_usd, shares_override=shares)
         )
         if not trade:
             return None
+        if model_details:
+            trade.model_details = model_details
         trade.forecast_source = f"model_awc_high_lightgbm:{MODEL_AWC_MODEL_PATH or config['trading'].get('model_awc_model_path', '')}"
         trade.forecast_observed_at = latest_row.valid_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
         trade.forecast_first_valid_time_local = latest_local.isoformat(timespec="seconds")
@@ -3692,6 +3748,7 @@ def process_model_awc_prediction(
         side: str,
         reason: str,
         max_buy_price: Optional[float] = None,
+        model_details: str = "",
     ) -> Optional[PaperTrade]:
         if not live_trader:
             return None
@@ -3711,15 +3768,17 @@ def process_model_awc_prediction(
             target_notional_usd=target_notional,
             local_minute=local_minute,
             max_buy_prices=max_buy_prices,
+            model_details=model_details,
         )
         LOGGER.info(
             "model awc single interval delegated to notional websocket manager "
-            "batch=%s market=%s target_notional_usd=%.2f max_buy_price=%s reason=%s",
+            "batch=%s market=%s target_notional_usd=%.2f max_buy_price=%s reason=%s model_details=%r",
             batch_id,
             market.market_id,
             target_notional,
             None if max_buy_price is None else round(float(max_buy_price), 6),
             reason,
+            model_details,
         )
         return None
 
@@ -3764,11 +3823,26 @@ def process_model_awc_prediction(
             selected_fair_price = model_awc_dynamic_side_price(
                 config, selected_prob, "YES"
             )
+            selected_model_details = model_awc_build_trade_model_details(
+                predicted_high_f=predicted_high_f,
+                rounded_prediction_f=rounded_prediction_f,
+                regression_market=predicted_market,
+                classifier_market=classifier_market if model_awc_classifier_enabled(config) else None,
+                classifier_probability=classifier_probability,
+                regressor_probability=None if not regressor_confidence else regressor_confidence.get("probability"),
+                selected_market=predicted_market,
+                selected_side="YES",
+                selected_price=0.0,
+                fair_price=selected_fair_price,
+                edge=None,
+                combined_yes_probability=selected_prob,
+            )
             partial_trade = start_single_notional_manager(
                 predicted_market,
                 "YES",
                 "insufficient_current_depth_or_no_dynamic_edge",
                 max_buy_price=selected_fair_price,
+                model_details=selected_model_details,
             )
             LOGGER.info(
                 "model awc skip no priced single candidates city=%s station=%s "
@@ -3796,6 +3870,21 @@ def process_model_awc_prediction(
         price = round(float(selected["price"]), 2)
         fair_price = selected.get("fair_price")
         edge = selected.get("edge")
+        selected_probability_info = combined_yes_probabilities.get(market.market_id, {})
+        model_details = model_awc_build_trade_model_details(
+            predicted_high_f=predicted_high_f,
+            rounded_prediction_f=rounded_prediction_f,
+            regression_market=predicted_market,
+            classifier_market=classifier_market if model_awc_classifier_enabled(config) else None,
+            classifier_probability=classifier_probability,
+            regressor_probability=None if not regressor_confidence else regressor_confidence.get("probability"),
+            selected_market=market,
+            selected_side=side,
+            selected_price=price,
+            fair_price=fair_price,
+            edge=edge,
+            combined_yes_probability=selected_probability_info.get("combined_yes_probability"),
+        )
         LOGGER.info(
             "model awc selected dynamic candidate city=%s station=%s event_date=%s "
             "local_hour=%s market=%s side=%s price=%.4f fair_price=%s "
@@ -3813,9 +3902,20 @@ def process_model_awc_prediction(
         )
         if live_trader:
             return start_single_notional_manager(
-                market, side, "single_interval_managed", max_buy_price=fair_price
+                market,
+                side,
+                "single_interval_managed",
+                max_buy_price=fair_price,
+                model_details=model_details,
             )
-        return submit_model_awc_trade(market, side, price, reason, max_buy_price=fair_price)
+        return submit_model_awc_trade(
+            market,
+            side,
+            price,
+            reason,
+            max_buy_price=fair_price,
+            model_details=model_details,
+        )
 
     predicted_yes_market, rounded_prediction_f = model_awc_rounded_prediction_market(
         markets, predicted_high_f, event_unit
@@ -5052,8 +5152,10 @@ def notify_trade(config: dict[str, Any], trade: PaperTrade, action: str, status:
         f"Shares: {float(trade.shares or 0.0):.4f}",
         f"Market: {_telegram_escape(trade.city)} {_telegram_escape(trade.kind)} {trade.event_date}",
         f"Question: {_telegram_escape(trade.market_question)}",
-        f"Reason: {_telegram_escape(reason or trade.exit_reason or trade.forecast_source)}",
     ]
+    if getattr(trade, "model_details", ""):
+        lines.append(f"Models:\n{_telegram_escape(trade.model_details)}")
+    lines.append(f"Reason: {_telegram_escape(reason or trade.exit_reason or trade.forecast_source)}")
     if order_id:
         lines.append(f"Order: `{_telegram_escape(order_id)}`")
     if source:
@@ -5190,6 +5292,7 @@ class LiveTradingManager:
         shares: Optional[float] = None,
         notify_submitted: bool = True,
         max_buy_price: Optional[float] = None,
+        model_details: str = "",
     ) -> Optional[PaperTrade]:
         """Post a live buy order and return a BUY_PENDING trade row when accepted by the CLOB.
         
@@ -5292,6 +5395,8 @@ class LiveTradingManager:
             notional_usdc=float(_result_value(result, "amount_usd", amount)),
             shares_override=float(_result_value(result, "shares", shares or 0.0)) if shares is not None else None,
         )
+        if model_details:
+            trade.model_details = model_details
         self._apply_buy_result_to_trade(trade, result, pending=True)
         self._register_pending(
             LivePendingOrder(
@@ -5326,6 +5431,7 @@ class LiveTradingManager:
         target_notional_usd: float = 0.0,
         local_minute: int = 0,
         max_buy_prices: Optional[dict[str, float]] = None,
+        model_details: str = "",
     ) -> str:
         """Replace the prior city/hour target and begin websocket order management."""
         if not self.executor or not self.market_feed:
@@ -5382,6 +5488,7 @@ class LiveTradingManager:
             average_prices={token_id: 0.0 for token_id in token_ids},
             open_order_ids={},
             max_buy_prices=dict(max_buy_prices or {}),
+            model_details=model_details,
             expires_ts=time.time()
             + max(
                 1.0,
@@ -5610,6 +5717,7 @@ class LiveTradingManager:
             shares=order_shares,
             notify_submitted=False,
             max_buy_price=batch.max_buy_prices.get(batch.token_ids[leg_index]),
+            model_details=batch.model_details,
         )
         if trade is None:
             return None
