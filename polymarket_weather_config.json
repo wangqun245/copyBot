@@ -114,6 +114,11 @@
                     ,"model_awc_classifier_model_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/lightgbm_polymarket_rounded_high_classifier.pkl"
                     ,"model_awc_classifier_metadata_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/classifier_metadata.json"
                     ,"model_awc_classifier_min_interval_probability": 0.01
+                    ,"model_awc_regressor_calibration_enabled": true
+                    ,"model_awc_regressor_calibration_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/regressor_error_calibration_station_month_hour.csv"
+                    ,"model_awc_regressor_calibration_sigma_column": "error_robust_sigma_f"
+                    ,"model_awc_classifier_probability_weight": 0.5
+                    ,"model_awc_regressor_probability_weight": 0.5
                     ,"model_awc_live_stations": [
                         "KATL",
                         "KAUS",
@@ -299,6 +304,11 @@
                                            ,"model_awc_classifier_model_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/lightgbm_polymarket_rounded_high_classifier.pkl"
                                            ,"model_awc_classifier_metadata_path": "models/polymarket_rounded_high_classifier_lag10_prevday_hour10_18_light_excl2026_gpu_20260707/classifier_metadata.json"
                                            ,"model_awc_classifier_min_interval_probability": 0.01
+                                           ,"model_awc_regressor_calibration_enabled": true
+                                           ,"model_awc_regressor_calibration_path": "models/lightgbm_rolling_6y_holdout_24h_lag10_speci_context_regular_prevday_20260630/regressor_error_calibration_station_month_hour.csv"
+                                           ,"model_awc_regressor_calibration_sigma_column": "error_robust_sigma_f"
+                                           ,"model_awc_classifier_probability_weight": 0.5
+                                           ,"model_awc_regressor_probability_weight": 0.5
                                            ,"model_awc_live_stations": [
                                                "KATL",
                                                "KAUS",
