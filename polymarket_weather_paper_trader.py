@@ -5963,6 +5963,7 @@ class LiveTradingManager:
         self._pending: dict[str, LivePendingOrder] = {}
         self._hourly_batches: dict[str, ModelAwcHourlyBatch] = {}
         self._managed_order_ids: set[str] = set()
+        self._live_buy_intent_keys: set[str] = set()
         self._market_wakeup = threading.Event()
         self._lock = threading.RLock()
         self._running = False
@@ -6095,96 +6096,144 @@ class LiveTradingManager:
                 side,
             )
             return None
-        max_price = (
-            float(max_buy_price)
-            if max_buy_price is not None
-            else configured_max_buy_price(config)
+        strategy_name = str(
+            config.get("trading", {}).get(
+                "strategy_name",
+                self.config.get("trading", {}).get("strategy_name", "weather_extreme"),
+            )
         )
-        if float(entry_price) > max_price:
-            LOGGER.info(
-                "live buy skipped price above max side=%s market=%s price=%.4f max_buy_price=%.4f dynamic=%s",
-                side,
-                market.market_id,
-                float(entry_price),
-                max_price,
-                max_buy_price is not None,
-            )
-            return None
-        neg_risk = market_neg_risk(market)
-        if shares is not None:
-            amount = round(float(shares) * float(entry_price), 2)
-            LOGGER.info(
-                "live buy target fixed shares side=%s market=%s price=%.4f target_shares=%s target_amount_usd=%.2f neg_risk=%s",
-                side,
-                market.market_id,
-                float(entry_price),
-                shares,
-                amount,
-                neg_risk,
-            )
-            result = self.executor.place_buy_order_shares(
-                token_id,
-                float(shares),
-                price=entry_price,
-                neg_risk=neg_risk,
-                max_buy_price=max_price,
-            )
-        else:
-            amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
-            LOGGER.info(
-                "live buy target notional side=%s market=%s price=%.4f target_amount_usd=%.2f neg_risk=%s",
-                side,
-                market.market_id,
-                float(entry_price),
-                amount,
-                neg_risk,
-            )
-            result = self.executor.place_buy_order(
-                token_id,
-                amount,
-                price=entry_price,
-                neg_risk=neg_risk,
-                max_buy_price=max_price,
-            )
-        if not _result_value(result, "success", False):
-            LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
-            return None
-
-        trade = make_trade(
-            config,
-            cycle_id,
-            market,
-            wu_source,
-            station,
+        intent_key = self._live_buy_intent_key(
+            strategy_name,
+            market.event_date,
+            market.market_id,
             side,
-            float(_result_value(result, "price", entry_price)),
-            observed_high,
-            observed_low,
-            reason,
-            notional_usdc=float(_result_value(result, "amount_usd", amount)),
-            shares_override=float(_result_value(result, "shares", shares or 0.0)) if shares is not None else None,
         )
-        if model_details:
-            trade.model_details = model_details
-        self._apply_buy_result_to_trade(trade, result, pending=True)
-        self._register_pending(
-            LivePendingOrder(
-                kind="BUY",
-                trade_id=trade.trade_id,
-                order_id=str(_result_value(result, "order_id", "")),
-                token_id=token_id,
-                condition_id=market.condition_id,
-                price=float(_result_value(result, "price", entry_price)),
-                shares=float(_result_value(result, "shares", trade.shares)),
-                created_ts=time.time(),
-                balance_before=float(_result_value(result, "balance_before", 0.0) or 0.0),
-                token_balance_before=_result_value(result, "token_balance_before", None),
+        with self._lock:
+            if intent_key in self._live_buy_intent_keys:
+                LOGGER.warning(
+                    "live buy skipped duplicate in-flight intent strategy=%s event_date=%s market=%s side=%s",
+                    strategy_name,
+                    market.event_date,
+                    market.market_id,
+                    side,
+                )
+                return None
+            self._live_buy_intent_keys.add(intent_key)
+        intent_kept = False
+        try:
+            try:
+                current_trades = read_trades(config["outputs"]["trades_csv"])
+            except Exception:
+                LOGGER.exception(
+                    "live buy duplicate disk check failed market=%s side=%s",
+                    market.market_id,
+                    side,
+                )
+                current_trades = []
+            if open_trade_exists(current_trades, strategy_name, market.market_id, side):
+                LOGGER.warning(
+                    "live buy skipped duplicate active trade strategy=%s event_date=%s market=%s side=%s",
+                    strategy_name,
+                    market.event_date,
+                    market.market_id,
+                    side,
+                )
+                return None
+            max_price = (
+                float(max_buy_price)
+                if max_buy_price is not None
+                else configured_max_buy_price(config)
             )
-        )
-        LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s neg_risk=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares, neg_risk)
-        if notify_submitted:
-            notify_trade(config, trade, "BUY", "SUBMITTED", reason)
-        return trade
+            if float(entry_price) > max_price:
+                LOGGER.info(
+                    "live buy skipped price above max side=%s market=%s price=%.4f max_buy_price=%.4f dynamic=%s",
+                    side,
+                    market.market_id,
+                    float(entry_price),
+                    max_price,
+                    max_buy_price is not None,
+                )
+                return None
+            neg_risk = market_neg_risk(market)
+            if shares is not None:
+                amount = round(float(shares) * float(entry_price), 2)
+                LOGGER.info(
+                    "live buy target fixed shares side=%s market=%s price=%.4f target_shares=%s target_amount_usd=%.2f neg_risk=%s",
+                    side,
+                    market.market_id,
+                    float(entry_price),
+                    shares,
+                    amount,
+                    neg_risk,
+                )
+                result = self.executor.place_buy_order_shares(
+                    token_id,
+                    float(shares),
+                    price=entry_price,
+                    neg_risk=neg_risk,
+                    max_buy_price=max_price,
+                )
+            else:
+                amount = float(amount_usd if amount_usd is not None else config["trading"]["buy_notional_usdc"])
+                LOGGER.info(
+                    "live buy target notional side=%s market=%s price=%.4f target_amount_usd=%.2f neg_risk=%s",
+                    side,
+                    market.market_id,
+                    float(entry_price),
+                    amount,
+                    neg_risk,
+                )
+                result = self.executor.place_buy_order(
+                    token_id,
+                    amount,
+                    price=entry_price,
+                    neg_risk=neg_risk,
+                    max_buy_price=max_price,
+                )
+            if not _result_value(result, "success", False):
+                LOGGER.error("live buy rejected side=%s market=%s price=%s neg_risk=%s error=%s", side, market.market_id, entry_price, neg_risk, _result_value(result, "error", ""))
+                return None
+
+            trade = make_trade(
+                config,
+                cycle_id,
+                market,
+                wu_source,
+                station,
+                side,
+                float(_result_value(result, "price", entry_price)),
+                observed_high,
+                observed_low,
+                reason,
+                notional_usdc=float(_result_value(result, "amount_usd", amount)),
+                shares_override=float(_result_value(result, "shares", shares or 0.0)) if shares is not None else None,
+            )
+            if model_details:
+                trade.model_details = model_details
+            self._apply_buy_result_to_trade(trade, result, pending=True)
+            self._register_pending(
+                LivePendingOrder(
+                    kind="BUY",
+                    trade_id=trade.trade_id,
+                    order_id=str(_result_value(result, "order_id", "")),
+                    token_id=token_id,
+                    condition_id=market.condition_id,
+                    price=float(_result_value(result, "price", entry_price)),
+                    shares=float(_result_value(result, "shares", trade.shares)),
+                    created_ts=time.time(),
+                    balance_before=float(_result_value(result, "balance_before", 0.0) or 0.0),
+                    token_balance_before=_result_value(result, "token_balance_before", None),
+                )
+            )
+            LOGGER.info("live buy pending trade=%s order=%s side=%s market=%s price=%s shares=%s neg_risk=%s", trade.trade_id, trade.live_buy_order_id, side, market.market_id, trade.yes_price, trade.shares, neg_risk)
+            if notify_submitted:
+                notify_trade(config, trade, "BUY", "SUBMITTED", reason)
+            intent_kept = True
+            return trade
+        finally:
+            if not intent_kept:
+                with self._lock:
+                    self._live_buy_intent_keys.discard(intent_key)
 
     def start_model_awc_hourly_batch(
         self,
@@ -6216,10 +6265,18 @@ class LiveTradingManager:
         if not all(token_ids):
             raise RuntimeError(f"missing token id for managed batch {batch_id}")
         with self._lock:
+            existing = self._hourly_batches.get(batch_id)
+            if existing is not None and not existing.closed and time.time() < existing.expires_ts:
+                LOGGER.info(
+                    "model awc hourly batch duplicate skipped batch=%s mode=%s",
+                    batch_id,
+                    mode,
+                )
+                return batch_id
             old_batches = [
                 batch
                 for key, batch in self._hourly_batches.items()
-                if key.startswith(group_prefix)
+                if key.startswith(group_prefix) and key != batch_id
             ]
         for old in old_batches:
             self._close_hourly_batch(old, "next_hour_model_output")
@@ -6465,10 +6522,19 @@ class LiveTradingManager:
         reason: str,
     ) -> Optional[PaperTrade]:
         order_shares = float(int(max(0.0, shares)))
-        if order_shares < 1:
+        token_id = batch.token_ids[leg_index]
+        minimum_shares = self._minimum_order_shares(token_id)
+        if order_shares < minimum_shares:
+            LOGGER.info(
+                "model awc managed order skipped below minimum batch=%s token=%s shares=%.4f minimum=%.4f",
+                batch.batch_id,
+                token_id[:16],
+                order_shares,
+                minimum_shares,
+            )
             return None
-        if batch.token_ids[leg_index] in batch.open_order_ids:
-            self._cancel_batch_order(batch, batch.token_ids[leg_index])
+        if token_id in batch.open_order_ids:
+            self._cancel_batch_order(batch, token_id)
         market = batch.markets[leg_index]
         side = batch.sides[leg_index]
         trade = self.submit_buy_trade(
@@ -6495,7 +6561,6 @@ class LiveTradingManager:
         write_csv(self.config["outputs"]["trades_csv"], trades)
         write_csv(self.config["outputs"]["settled_trades_csv"], trades)
         write_performance_reports(self.config, trades)
-        token_id = batch.token_ids[leg_index]
         batch.open_order_ids[token_id] = trade.live_buy_order_id
         reserved_cost = float(
             getattr(
@@ -6524,6 +6589,22 @@ class LiveTradingManager:
         if price is None or price.best_ask <= 0 or price.ask_size <= 0:
             return None
         return float(price.best_ask), float(price.ask_size)
+
+    def _minimum_order_shares(self, token_id: str) -> float:
+        if not self.executor:
+            return 1.0
+        minimum_fn = getattr(self.executor, "minimum_order_shares", None)
+        if not callable(minimum_fn):
+            return 1.0
+        try:
+            return max(1.0, float(minimum_fn(token_id)))
+        except Exception:
+            LOGGER.exception("minimum order share lookup failed token=%s", token_id[:16])
+            return 1.0
+
+    @staticmethod
+    def _live_buy_intent_key(strategy_name: str, event_date: str, market_id: str, side: str) -> str:
+        return f"{strategy_name}:{event_date}:{market_id}:{side.upper()}"
 
     def _manage_hourly_batch(self, batch: ModelAwcHourlyBatch) -> None:
         if batch.closed:
@@ -6602,7 +6683,7 @@ class LiveTradingManager:
                     continue
                 price = float(offer[0])
                 shares = min(float(offer[1]), remaining_notional / price)
-                if shares >= 1:
+                if shares >= self._minimum_order_shares(candidate_token):
                     executable_candidates.append(
                         (price, str(batch.markets[leg_index].market_id), side, leg_index, shares)
                     )
@@ -6622,9 +6703,9 @@ class LiveTradingManager:
                         f"{below_floor_sides[0]}_below_confidence_floor",
                     )
                 return
-            if shares < 1:
+            if shares < self._minimum_order_shares(batch.token_ids[leg_index]):
                 self._close_hourly_batch(
-                    batch, "target_unfillable_notional_remainder"
+                    batch, "target_unfillable_minimum_order_size"
                 )
                 return
             self._submit_batch_order(batch, leg_index, shares, price, reason)
@@ -6656,7 +6737,7 @@ class LiveTradingManager:
             if offer[0] > max_price:
                 return
             shares = min(float(remaining), float(offer[1]))
-            if shares < 1:
+            if shares < self._minimum_order_shares(token):
                 return
             self._submit_batch_order(
                 batch,
@@ -7256,6 +7337,16 @@ class LiveTradingManager:
                     )
                 else:
                     trade.status = "BUY_CANCELLED" if cancelled else "BUY_CANCEL_FAILED"
+                    if cancelled:
+                        with self._lock:
+                            self._live_buy_intent_keys.discard(
+                                self._live_buy_intent_key(
+                                    trade.strategy,
+                                    trade.event_date,
+                                    trade.market_id,
+                                    trade.position_side or "YES",
+                                )
+                            )
             else:
                 trade.status = "OPEN"
             break
