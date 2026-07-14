@@ -1483,6 +1483,11 @@ def comparable_rule_bounds(market: TemperatureMarket, target_unit: str) -> tuple
     return convert_temperature(market.rule_min, market.unit, target_unit), convert_temperature(market.rule_max, market.unit, target_unit), target_unit.upper()
 
 
+def finite_temperature_market(market: TemperatureMarket) -> bool:
+    """Return True for closed finite intervals such as 78-79F."""
+    return market.rule_min is not None and market.rule_max is not None
+
+
 def market_contains_temperature(market: TemperatureMarket, target_temp: float, target_unit: str) -> bool:
     """Check whether a target temperature falls within a market rule range.
     
@@ -3323,7 +3328,7 @@ def model_awc_kalshi_high_guard_allows_trade(
     fail_closed = model_awc_kalshi_high_guard_fail_closed(config)
     poly_midpoint = model_awc_finite_market_midpoint_f(polymarket_market)
     if poly_midpoint is None:
-        return (not fail_closed), {
+        return False, {
             "enabled": True,
             "available": False,
             "reason": "polymarket_interval_midpoint_unavailable",
@@ -3357,11 +3362,17 @@ def model_awc_kalshi_high_guard_allows_trade(
         }
     threshold = model_awc_kalshi_high_guard_threshold_f(config)
     diff = float(kalshi_midpoint) - float(poly_midpoint)
-    allowed = diff <= threshold
+    allowed = 0.0 <= diff <= threshold
+    if diff < 0.0:
+        reason = "polymarket_midpoint_above_kalshi"
+    elif diff > threshold:
+        reason = "kalshi_midpoint_too_high"
+    else:
+        reason = "ok"
     return allowed, {
         "enabled": True,
         "available": True,
-        "reason": "ok" if allowed else "kalshi_midpoint_too_high",
+        "reason": reason,
         "threshold_f": threshold,
         "diff_f": diff,
         "polymarket_midpoint_f": poly_midpoint,
@@ -3886,6 +3897,14 @@ def model_awc_market_candidate(
     max_buy_price: Optional[float] = None,
 ) -> Optional[dict[str, Any]]:
     """Return the YES/NO side and executable price implied by one market range."""
+    if not finite_temperature_market(market):
+        LOGGER.info(
+            "model awc skip open-ended boundary market market=%s side_candidate=%s question=%r",
+            market.market_id,
+            "YES" if market.market_id == predicted_yes_market_id else "NO",
+            market.market_question,
+        )
+        return None
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
     if predicted is None:
         return None
@@ -3967,7 +3986,8 @@ def model_awc_rounded_prediction_market(
     matches = [
         market
         for market in markets
-        if market_contains_temperature(market, float(rounded_for_event), event_unit)
+        if finite_temperature_market(market)
+        and market_contains_temperature(market, float(rounded_for_event), event_unit)
     ]
     if len(matches) != 1:
         return None, rounded_f
@@ -4014,6 +4034,8 @@ def model_awc_classifier_interval_choice(
     min_probability = model_awc_classifier_min_interval_probability(config)
     candidates: list[dict[str, Any]] = []
     for market in markets:
+        if not finite_temperature_market(market):
+            continue
         interval_probability = 0.0
         included_temperatures: list[int] = []
         for temp_f, probability in temp_probabilities.items():
@@ -4056,6 +4078,13 @@ def model_awc_classifier_interval_probabilities(
     )
     probabilities: dict[str, dict[str, Any]] = {}
     for market in markets:
+        if not finite_temperature_market(market):
+            probabilities[market.market_id] = {
+                "probability": 0.0,
+                "temperatures_f": (),
+                "skipped": "open_ended_boundary_market",
+            }
+            continue
         interval_probability = 0.0
         included_temperatures: list[int] = []
         for temp_f, probability in temp_probabilities.items():
@@ -4096,7 +4125,12 @@ def model_awc_prediction_matches(
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
     if predicted is None:
         return []
-    return [market for market in markets if market_contains_temperature(market, float(predicted), event_unit)]
+    return [
+        market
+        for market in markets
+        if finite_temperature_market(market)
+        and market_contains_temperature(market, float(predicted), event_unit)
+    ]
 
 
 def model_awc_interval_snap_tolerance(config: dict[str, Any], event_unit: str) -> float:
@@ -4123,6 +4157,8 @@ def model_awc_boundary_snap_market(
     epsilon = 1e-9
     candidates: list[tuple[float, TemperatureMarket]] = []
     for market in markets:
+        if not finite_temperature_market(market):
+            continue
         lo, hi, _ = comparable_rule_bounds(market, event_unit)
         if lo is not None and float(predicted) < lo:
             distance = lo - float(predicted)
@@ -4147,7 +4183,12 @@ def model_awc_adjacent_prediction_markets(
     predicted = convert_temperature(predicted_high_f, "F", event_unit)
     if predicted is None:
         return None
-    matched = [market for market in markets if market_contains_temperature(market, float(predicted), event_unit)]
+    finite_markets = [market for market in markets if finite_temperature_market(market)]
+    matched = [
+        market
+        for market in finite_markets
+        if market_contains_temperature(market, float(predicted), event_unit)
+    ]
     if len(matched) == 2:
         ordered = sorted_markets_for_unit(matched, event_unit)
         return ordered[0], ordered[1]
@@ -4156,7 +4197,7 @@ def model_awc_adjacent_prediction_markets(
 
     lower_candidates: list[tuple[float, TemperatureMarket]] = []
     upper_candidates: list[tuple[float, TemperatureMarket]] = []
-    for market in markets:
+    for market in finite_markets:
         lo, hi, _ = comparable_rule_bounds(market, event_unit)
         if hi is not None and hi < float(predicted):
             lower_candidates.append((hi, market))

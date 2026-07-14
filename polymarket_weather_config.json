@@ -61,7 +61,7 @@
     "trading":  {
                     "strategy_name":  "model_awc_high",
                     "strategy_mode":  "model_awc_high",
-                    "buy_notional_usdc":  20,
+                    "buy_notional_usdc":  25,
                     "fee_rate":  0.05,
                     "fee_enabled":  true,
                     "deterministic_min_yes_price":  0.01,
@@ -143,7 +143,7 @@
                         "San Francisco": "KXHIGHTSFO",
                         "Seattle": "KXHIGHTSEA"
                     }
-                    ,"model_awc_observation_window_max_buy_prices": [0.60, 0.70, 0.80]
+                    ,"model_awc_observation_window_max_buy_prices": [0.70, 0.80, 0.90]
                     ,"model_awc_live_stations": [
                         "KATL",
                         "KAUS",
@@ -278,7 +278,7 @@
                            "trading":  {
                                            "strategy_name":  "model_awc_high",
                                            "strategy_mode":  "model_awc_high",
-                                           "buy_notional_usdc":  20,
+                                           "buy_notional_usdc":  25,
                                            "fee_rate":  0.05,
                                            "fee_enabled":  true,
                                            "deterministic_min_yes_price":  0.01,
@@ -338,7 +338,7 @@
                                            ,"model_awc_agree_min_classifier_probability": 0.70
                                            ,"model_awc_disagree_takeover_min_probability": 0.80
                                            ,"model_awc_disagree_takeover_min_gap": 0.30
-                                           ,"model_awc_observation_window_max_buy_prices": [0.60, 0.70, 0.80]
+                                           ,"model_awc_observation_window_max_buy_prices": [0.70, 0.80, 0.90]
                                            ,"model_awc_live_stations": [
                                                "KATL",
                                                "KAUS",
